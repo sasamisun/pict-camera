@@ -13,6 +13,7 @@ idf_component_register(
         "freertos"
         "esp_system"
         "esp_common"
+        "heap"
         "log"
     PRIV_REQUIRES
         "M5GFX"                       # M5Stack用グラフィックライブラリ
