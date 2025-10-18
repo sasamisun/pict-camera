@@ -25,6 +25,8 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 
+#include <M5GFX.h>
+
 // ========================================
 // 定数定義にゃ
 // ========================================

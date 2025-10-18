@@ -40,6 +40,11 @@
 #define PIN_MODE_PWM   0b00000001  // PWM モード
 #define PIN_MODE_ADC   0b00000010  // ADC モード
 
+//LED
+#define REG_LED_RED     0xCB  // 赤LED制御レジスタ
+#define REG_LED_GREEN   0x9B  // 緑LED制御レジスタ  
+#define REG_LED_BLUE    0x9C  // 青LED制御レジスタ
+
 // ========================================
 // ピン定義（RGB Encoder Breakout用）にゃ
 // ========================================
@@ -93,6 +98,8 @@ private:
     void set_pwm_output(uint8_t pin, uint16_t value);
     bool take_mutex(uint32_t timeout_ms = 100);
     void give_mutex();
+
+    esp_err_t test_device_communication();
 
 public:
     // コンストラクタ・デストラクタ

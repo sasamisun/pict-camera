@@ -1,12 +1,10 @@
 /*
  * AtomS3R ピクセルアートカメラ (ESP-IDF 5.4完全対応版)
- *
- * 新機能:
- * - ESP-IDF 5.4とesp-camera 2.1.3に完全対応にゃ
- * - I2C競合問題を根本解決にゃ
- * - Pimoroni RGB Encoderでパレット選択にゃ
- * - マルチコア処理で高速化にゃ
- * - エラーハンドリング強化にゃ
+ * 
+ * 新機能追加:
+ * - ステータス表示用LEDエンコーダ制御にゃ
+ * - 赤点滅: 操作禁止時（起動・撮影・書き込み中）
+ * - 青点灯: 操作可能時（待機中）
  */
 
 #include <stdio.h>
@@ -101,6 +99,26 @@ static const char *TAG = "PixelArtCamera";
 #define PROCESS_TASK_STACK 16384 // 画像処理用大きめスタック
 
 // ========================================
+// ステータスLED制御定義にゃ
+// ========================================
+typedef enum {
+    SYSTEM_STATUS_INITIALIZING,    // 初期化中（赤点滅）
+    SYSTEM_STATUS_READY,          // 待機中（青点灯）
+    SYSTEM_STATUS_CAPTURING,      // 撮影中（赤点滅）
+    SYSTEM_STATUS_SAVING,         // 保存中（赤点滅）
+    SYSTEM_STATUS_ERROR           // エラー（赤高速点滅）
+} system_status_t;
+
+// ステータス色定義
+#define STATUS_COLOR_RED_BLINK    0xFF0000  // 赤（操作禁止）
+#define STATUS_COLOR_BLUE_STEADY  0x0000FF  // 青（操作可能）
+#define STATUS_COLOR_OFF          0x000000  // 消灯
+
+// 点滅設定
+#define BLINK_NORMAL_INTERVAL_MS  500   // 通常点滅間隔
+#define BLINK_FAST_INTERVAL_MS    200   // 高速点滅間隔
+
+// ========================================
 // グローバル変数にゃ
 // ========================================
 
@@ -120,6 +138,10 @@ static volatile bool g_system_ready = false;
 static volatile int g_current_palette_index = 0;
 static volatile int g_file_counter = 1;
 static volatile uint32_t g_last_button_press = 0;
+
+// ステータスLED制御
+static volatile system_status_t g_system_status = SYSTEM_STATUS_INITIALIZING;
+static volatile bool g_status_led_enabled = true;
 
 // SDカード
 static sdmmc_card_t *g_sd_card = NULL;
@@ -163,7 +185,7 @@ static const uint32_t COLOR_PALETTES[8][8] = {
      0xA1B4C1, 0xF0B9B9, 0xFFD159, 0xFFFFFF},
 };
 
-// エンコーダLED用代表色
+// エンコーダLED用代表色（パレット選択時のみ使用）
 static const uint32_t PALETTE_REP_COLORS[8] = {
     0x8D697A, // パレット0: ピンク系
     0x437290, // パレット1: 青系
@@ -174,6 +196,80 @@ static const uint32_t PALETTE_REP_COLORS[8] = {
     0x38D88E, // パレット6: 緑系
     0xFFD159, // パレット7: 黄色系
 };
+
+// ========================================
+// ステータスLED制御関数にゃ
+// ========================================
+
+// システムステータス設定
+static void set_system_status(system_status_t status) {
+    system_status_t old_status = g_system_status;
+    g_system_status = status;
+    
+    const char* status_names[] = {
+        "INITIALIZING", "READY", "CAPTURING", "SAVING", "ERROR"
+    };
+    
+    if (old_status != status) {
+        ESP_LOGI(TAG, "🎨 システムステータス変更: %s -> %s", 
+                 status_names[old_status], status_names[status]);
+    }
+}
+
+// エンコーダLED更新（ステータス優先）
+static void update_encoder() {
+    if (!g_encoder || !g_encoder->is_initialized() || !g_status_led_enabled) {
+        return;
+    }
+    
+    static uint32_t last_blink_time = 0;
+    static bool blink_state = false;
+    uint32_t current_time = esp_timer_get_time() / 1000;
+    
+    switch (g_system_status) {
+        case SYSTEM_STATUS_READY:
+            // 待機中: 青点灯 + パレット色も表示
+            if (g_current_palette_index >= 0 && g_current_palette_index < 8) {
+                // パレット代表色を薄めの青とミックス
+                uint32_t palette_color = PALETTE_REP_COLORS[g_current_palette_index];
+                uint8_t r = ((palette_color >> 16) & 0xFF) / 4;  // 25%の明度
+                uint8_t g = ((palette_color >> 8) & 0xFF) / 4;
+                uint8_t b = ((palette_color & 0xFF) / 4) + 64;   // 青成分を強化
+                g_encoder->set_led(r, g, b);
+            } else {
+                g_encoder->set_led_color(STATUS_COLOR_BLUE_STEADY);
+            }
+            break;
+            
+        case SYSTEM_STATUS_INITIALIZING:
+        case SYSTEM_STATUS_CAPTURING:
+        case SYSTEM_STATUS_SAVING:
+            // 操作禁止: 赤点滅
+            if (current_time - last_blink_time >= BLINK_NORMAL_INTERVAL_MS) {
+                blink_state = !blink_state;
+                last_blink_time = current_time;
+                g_encoder->set_led_color(blink_state ? STATUS_COLOR_RED_BLINK : STATUS_COLOR_OFF);
+            }
+            break;
+            
+        case SYSTEM_STATUS_ERROR:
+            // エラー: 赤高速点滅
+            if (current_time - last_blink_time >= BLINK_FAST_INTERVAL_MS) {
+                blink_state = !blink_state;
+                last_blink_time = current_time;
+                g_encoder->set_led_color(blink_state ? STATUS_COLOR_RED_BLINK : STATUS_COLOR_OFF);
+            }
+            break;
+    }
+}
+
+// ステータスLED有効/無効切り替え
+static void enable_status_led(bool enable) {
+    g_status_led_enabled = enable;
+    if (!enable && g_encoder && g_encoder->is_initialized()) {
+        g_encoder->led_off();
+    }
+}
 
 // ========================================
 // GPIO制御関数にゃ
@@ -225,6 +321,7 @@ static bool is_button_pressed()
 static esp_err_t init_gpio()
 {
     ESP_LOGI(TAG, "🔧 GPIO初期化開始にゃ");
+    set_system_status(SYSTEM_STATUS_INITIALIZING);
 
     // ボタンピン設定（プルアップ）
     gpio_config_t button_config = {
@@ -237,6 +334,7 @@ static esp_err_t init_gpio()
     if (ret != ESP_OK)
     {
         ESP_LOGE(TAG, "ボタンGPIO設定失敗: %s", esp_err_to_name(ret));
+        set_system_status(SYSTEM_STATUS_ERROR);
         return ret;
     }
 
@@ -251,6 +349,7 @@ static esp_err_t init_gpio()
     if (ret != ESP_OK)
     {
         ESP_LOGE(TAG, "LED GPIO設定失敗: %s", esp_err_to_name(ret));
+        set_system_status(SYSTEM_STATUS_ERROR);
         return ret;
     }
 
@@ -265,6 +364,7 @@ static esp_err_t init_gpio()
     if (ret != ESP_OK)
     {
         ESP_LOGE(TAG, "電源GPIO設定失敗: %s", esp_err_to_name(ret));
+        set_system_status(SYSTEM_STATUS_ERROR);
         return ret;
     }
 
@@ -302,6 +402,7 @@ static esp_err_t init_i2c_master()
     if (ret != ESP_OK)
     {
         ESP_LOGE(TAG, "I2Cバス作成失敗: %s", esp_err_to_name(ret));
+        set_system_status(SYSTEM_STATUS_ERROR);
         return ret;
     }
 
@@ -345,6 +446,7 @@ static esp_err_t init_sdcard()
     if (ret != ESP_OK)
     {
         ESP_LOGE(TAG, "SPIバス初期化失敗: %s", esp_err_to_name(ret));
+        set_system_status(SYSTEM_STATUS_ERROR);
         return ret;
     }
 
@@ -363,6 +465,7 @@ static esp_err_t init_sdcard()
     if (ret != ESP_OK)
     {
         ESP_LOGE(TAG, "SDカードマウント失敗: %s", esp_err_to_name(ret));
+        set_system_status(SYSTEM_STATUS_ERROR);
         return ret;
     }
 
@@ -428,14 +531,13 @@ static esp_err_t init_camera()
     camera_config.fb_location = (psram_size > 0) ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
     camera_config.grab_mode = CAMERA_GRAB_LATEST;
     camera_config.sccb_i2c_port = CAMERA_I2C_NUM;
-    //camera_config.task_stack = 4096;
-    //camera_config.task_pri = configMAX_PRIORITIES - 2;
 
     // カメラドライバ初期化
     esp_err_t err = esp_camera_init(&camera_config);
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "❌ カメラ初期化失敗: 0x%x (%s)", err, esp_err_to_name(err));
+        set_system_status(SYSTEM_STATUS_ERROR);
         return err;
     }
 
@@ -460,15 +562,78 @@ static esp_err_t init_camera()
 }
 
 // ========================================
+// 修正版I2Cスキャン機能にゃ
+// ========================================
+static void scan_i2c_devices() {
+    ESP_LOGI(TAG, "🔍 I2Cデバイススキャン開始");
+    
+    if (!g_i2c_bus_handle) {
+        ESP_LOGE(TAG, "❌ I2Cバスが初期化されていません");
+        return;
+    }
+    
+    int devices_found = 0;
+    
+    for (uint8_t addr = 0x03; addr <= 0x77; addr++) {
+        // ESP-IDF 5.4の新しいプローブ機能を使用にゃ
+        esp_err_t ret = i2c_master_probe(g_i2c_bus_handle, addr, 1000);  // 1秒タイムアウト
+        
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "✅ I2Cデバイス発見: 0x%02X (%d)", addr, addr);
+            devices_found++;
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(10)); // 10ms待機（安全のため）
+    }
+    
+    ESP_LOGI(TAG, "📊 スキャン完了: %d個のデバイスを発見", devices_found);
+    
+    if (devices_found == 0) {
+        ESP_LOGW(TAG, "⚠️ I2Cデバイスが見つかりませんでした");
+        ESP_LOGI(TAG, "🔧 確認事項:");
+        ESP_LOGI(TAG, "  1. エンコーダの電源（3.3V/5V）");
+        ESP_LOGI(TAG, "  2. SDA配線 (GPIO%d)", I2C_SDA_PIN);
+        ESP_LOGI(TAG, "  3. SCL配線 (GPIO%d)", I2C_SCL_PIN);
+        ESP_LOGI(TAG, "  4. GND接続");
+        ESP_LOGI(TAG, "  5. プルアップ抵抗（内蔵プルアップ有効済み）");
+        ESP_LOGI(TAG, "  6. エンコーダモジュールの動作確認");
+        
+        // GPIO状態確認
+        ESP_LOGI(TAG, "🔍 GPIO状態確認:");
+        ESP_LOGI(TAG, "  SDA (GPIO%d): %s", I2C_SDA_PIN, gpio_get_level((gpio_num_t)I2C_SDA_PIN) ? "HIGH" : "LOW");
+        ESP_LOGI(TAG, "  SCL (GPIO%d): %s", I2C_SCL_PIN, gpio_get_level((gpio_num_t)I2C_SCL_PIN) ? "HIGH" : "LOW");
+    } else {
+        // Pimoroniエンコーダの一般的なアドレスをチェック
+        const uint8_t pimoroni_addresses[] = {0x0F, 0x12, 0x20, 0x21, 0x22, 0x23};
+        bool found_pimoroni = false;
+        
+        for (int i = 0; i < sizeof(pimoroni_addresses); i++) {
+            esp_err_t ret = i2c_master_probe(g_i2c_bus_handle, pimoroni_addresses[i], 1000);
+            if (ret == ESP_OK) {
+                ESP_LOGI(TAG, "🎯 Pimoroni候補発見: 0x%02X", pimoroni_addresses[i]);
+                found_pimoroni = true;
+            }
+        }
+        
+        if (!found_pimoroni) {
+            ESP_LOGW(TAG, "⚠️ Pimoroniエンコーダらしきデバイスが見つかりません");
+            ESP_LOGI(TAG, "💡 検出されたデバイスが別のアドレスにある可能性があります");
+        }
+    }
+}
+
+// ========================================
 // エンコーダ初期化にゃ
 // ========================================
 static esp_err_t init_encoder()
 {
+    scan_i2c_devices();
     ESP_LOGI(TAG, "🔧 エンコーダ初期化開始にゃ");
 
     if (!g_i2c_bus_handle)
     {
         ESP_LOGE(TAG, "❌ I2Cバスが初期化されていません");
+        set_system_status(SYSTEM_STATUS_ERROR);
         return ESP_FAIL;
     }
 
@@ -476,6 +641,7 @@ static esp_err_t init_encoder()
     if (!g_encoder)
     {
         ESP_LOGE(TAG, "❌ エンコーダオブジェクト作成失敗");
+        set_system_status(SYSTEM_STATUS_ERROR);
         return ESP_ERR_NO_MEM;
     }
 
@@ -492,7 +658,9 @@ static esp_err_t init_encoder()
     g_encoder->set_value_range(0, 7);                // パレット0-7
     g_encoder->set_value(0);                         // 初期値0
     g_encoder->set_led_brightness(0.3f);             // 輝度30%
-    g_encoder->set_led_color(PALETTE_REP_COLORS[0]); // 初期パレット色
+    
+    // 初期ステータス表示（初期化中なので赤点滅）
+    enable_status_led(true);
 
     ESP_LOGI(TAG, "✅ エンコーダ初期化完了にゃ");
     return ESP_OK;
@@ -509,6 +677,7 @@ static esp_err_t init_processor()
     if (!g_processor)
     {
         ESP_LOGE(TAG, "❌ 画像処理オブジェクト作成失敗");
+        set_system_status(SYSTEM_STATUS_ERROR);
         return ESP_ERR_NO_MEM;
     }
 
@@ -527,6 +696,7 @@ static esp_err_t init_camera_utils()
     if (!g_camera_utils)
     {
         ESP_LOGE(TAG, "❌ カメラユーティリティオブジェクト作成失敗");
+        set_system_status(SYSTEM_STATUS_ERROR);
         return ESP_ERR_NO_MEM;
     }
 
@@ -546,6 +716,7 @@ static esp_err_t init_sync_objects()
     if (!g_capture_semaphore)
     {
         ESP_LOGE(TAG, "❌ 撮影セマフォ作成失敗");
+        set_system_status(SYSTEM_STATUS_ERROR);
         return ESP_ERR_NO_MEM;
     }
 
@@ -553,6 +724,7 @@ static esp_err_t init_sync_objects()
     if (!g_i2c_mutex)
     {
         ESP_LOGE(TAG, "❌ I2Cミューテックス作成失敗");
+        set_system_status(SYSTEM_STATUS_ERROR);
         return ESP_ERR_NO_MEM;
     }
 
@@ -561,6 +733,7 @@ static esp_err_t init_sync_objects()
     if (!g_capture_queue)
     {
         ESP_LOGE(TAG, "❌ 撮影キュー作成失敗");
+        set_system_status(SYSTEM_STATUS_ERROR);
         return ESP_ERR_NO_MEM;
     }
 
@@ -571,29 +744,31 @@ static esp_err_t init_sync_objects()
 // ========================================
 // エンコーダ値更新とLED表示にゃ
 // ========================================
-static void update_encoder()
-{
-    if (!g_encoder || !g_encoder->is_initialized())
-        return;
+/*
+static void update_encoder() {
+    if (!g_encoder || !g_encoder->is_initialized()) return;
 
     // ミューテックスでI2C保護
-    if (xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(10)) == pdTRUE)
-    {
+    if (xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
         int new_value = g_encoder->update();
 
-        if (new_value != g_current_palette_index)
-        {
+        // 値に変化があった場合のみLED更新（重要！）
+        if (new_value != g_current_palette_index) {
+            ESP_LOGI(TAG, "🎨 パレット変更: %d → %d", g_current_palette_index, new_value);
             g_current_palette_index = new_value;
 
             // パレット代表色をLEDに表示
-            g_encoder->set_led_color(PALETTE_REP_COLORS[g_current_palette_index]);
-
-            ESP_LOGI(TAG, "🎨 パレット選択: %d", g_current_palette_index);
+            uint32_t rep_color = PALETTE_REP_COLORS[g_current_palette_index];
+            ESP_LOGI(TAG, "💡 LED色設定: パレット%d = 0x%06lX", 
+                     g_current_palette_index, (unsigned long)rep_color);
+                     
+            g_encoder->set_led_color(rep_color);
         }
 
         xSemaphoreGive(g_i2c_mutex);
     }
 }
+    */
 
 // ========================================
 // 撮影要求処理にゃ
@@ -635,6 +810,8 @@ static void capture_task(void *pvParameters)
             // キューから撮影要求を取得
             if (xQueueReceive(g_capture_queue, &request, pdMS_TO_TICKS(100)) == pdTRUE)
             {
+                // ステータス: 撮影中
+                set_system_status(SYSTEM_STATUS_CAPTURING);
 
                 ESP_LOGI(TAG, "📸 撮影開始: ファイル番号 %d", g_file_counter);
                 status_led_on();
@@ -644,12 +821,18 @@ static void capture_task(void *pvParameters)
                 if (!fb)
                 {
                     ESP_LOGE(TAG, "❌ フレーム取得失敗");
+                    set_system_status(SYSTEM_STATUS_ERROR);
                     status_led_blink(3, 200, 200); // エラー表示
+                    vTaskDelay(pdMS_TO_TICKS(2000)); // 2秒待機
+                    set_system_status(SYSTEM_STATUS_READY); // 復帰
                     continue;
                 }
 
                 ESP_LOGI(TAG, "📷 フレーム取得完了 (%dx%d, %zu bytes)",
                          fb->width, fb->height, fb->len);
+
+                // ステータス: 保存中
+                set_system_status(SYSTEM_STATUS_SAVING);
 
                 // 画像保存処理
                 bool success = true;
@@ -671,7 +854,10 @@ static void capture_task(void *pvParameters)
                 {
                     ESP_LOGE(TAG, "❌ 輝度計算失敗");
                     esp_camera_fb_return(fb);
+                    set_system_status(SYSTEM_STATUS_ERROR);
                     status_led_blink(3, 200, 200);
+                    vTaskDelay(pdMS_TO_TICKS(2000));
+                    set_system_status(SYSTEM_STATUS_READY);
                     continue;
                 }
 
@@ -722,11 +908,15 @@ static void capture_task(void *pvParameters)
                     temp_counter++;
                     g_file_counter = temp_counter;
                     status_led_blink(2, 100, 100); // 成功表示
+                    set_system_status(SYSTEM_STATUS_READY); // 待機状態に戻る
                 }
                 else
                 {
                     ESP_LOGE(TAG, "❌ 撮影失敗: ファイル番号 %d", g_file_counter);
+                    set_system_status(SYSTEM_STATUS_ERROR);
                     status_led_blink(3, 200, 200); // エラー表示
+                    vTaskDelay(pdMS_TO_TICKS(2000)); // 2秒待機
+                    set_system_status(SYSTEM_STATUS_READY); // 復帰
                 }
             }
         }
@@ -736,18 +926,31 @@ static void capture_task(void *pvParameters)
 // ========================================
 // エンコーダ監視タスク（コア0で実行）にゃ
 // ========================================
-static void encoder_task(void *pvParameters)
-{
+static void encoder_task(void *pvParameters) {
     ESP_LOGI(TAG, "🎛️ エンコーダタスク開始 (Core %d)", xPortGetCoreID());
 
-    while (!g_system_ready)
-    {
+    while (!g_system_ready) {
         vTaskDelay(pdMS_TO_TICKS(100)); // システム準備完了まで待機
     }
 
-    while (1)
-    {
+    // 初期LED設定
+    if (g_encoder && g_encoder->is_initialized()) {
+        ESP_LOGI(TAG, "🎨 初期パレット設定: %d", g_current_palette_index);
+        g_encoder->set_led_color(PALETTE_REP_COLORS[g_current_palette_index]);
+    }
+
+    uint32_t update_counter = 0;
+    
+    while (1) {
         update_encoder();
+        update_counter++;
+        
+        // 10秒ごとに統計表示
+        if (update_counter % 500 == 0) {  // 50Hz × 500 = 10秒
+            ESP_LOGI(TAG, "🎛️ エンコーダ統計: 更新回数=%lu, 現在値=%d", 
+                     (unsigned long)update_counter, g_current_palette_index);
+        }
+        
         vTaskDelay(pdMS_TO_TICKS(20)); // 50Hz更新
     }
 }
@@ -768,6 +971,13 @@ static void button_task(void *pvParameters)
     {
         if (is_button_pressed())
         {
+            // 操作禁止中は撮影を受け付けない
+            if (g_system_status != SYSTEM_STATUS_READY) {
+                ESP_LOGW(TAG, "⚠️ システムビジー中のため撮影を無視");
+                vTaskDelay(pdMS_TO_TICKS(100));
+                continue;
+            }
+
             ESP_LOGI(TAG, "🔘 ボタン押下検出！");
             ESP_LOGI(TAG, "🎨 現在のパレット: %d", g_current_palette_index);
 
@@ -829,6 +1039,7 @@ static void stats_task(void *pvParameters)
         ESP_LOGI(TAG, "\n📊 === システム統計情報 ===");
         ESP_LOGI(TAG, "🔢 撮影回数: %d", g_file_counter - 1);
         ESP_LOGI(TAG, "🎨 現在のパレット: %d", g_current_palette_index);
+        ESP_LOGI(TAG, "🎯 システムステータス: %d", g_system_status);
         ESP_LOGI(TAG, "💾 フリーヒープ: %lu bytes", (unsigned long)esp_get_free_heap_size());
         ESP_LOGI(TAG, "🧠 最小フリーヒープ: %lu bytes", (unsigned long)esp_get_minimum_free_heap_size());
 
@@ -852,6 +1063,7 @@ static void stats_task(void *pvParameters)
 static esp_err_t init_all_systems()
 {
     ESP_LOGI(TAG, "\n🚀 === システム初期化開始 ===");
+    set_system_status(SYSTEM_STATUS_INITIALIZING);
 
     esp_err_t ret;
 
@@ -934,6 +1146,7 @@ static esp_err_t create_tasks()
     if (result != pdPASS)
     {
         ESP_LOGE(TAG, "❌ 撮影タスク作成失敗");
+        set_system_status(SYSTEM_STATUS_ERROR);
         return ESP_FAIL;
     }
 
@@ -950,6 +1163,7 @@ static esp_err_t create_tasks()
     if (result != pdPASS)
     {
         ESP_LOGE(TAG, "❌ エンコーダタスク作成失敗");
+        set_system_status(SYSTEM_STATUS_ERROR);
         return ESP_FAIL;
     }
 
@@ -966,6 +1180,7 @@ static esp_err_t create_tasks()
     if (result != pdPASS)
     {
         ESP_LOGE(TAG, "❌ ボタンタスク作成失敗");
+        set_system_status(SYSTEM_STATUS_ERROR);
         return ESP_FAIL;
     }
 
@@ -982,6 +1197,7 @@ static esp_err_t create_tasks()
     if (result != pdPASS)
     {
         ESP_LOGE(TAG, "❌ 統計タスク作成失敗");
+        set_system_status(SYSTEM_STATUS_ERROR);
         return ESP_FAIL;
     }
 
@@ -995,6 +1211,9 @@ static esp_err_t create_tasks()
 static void cleanup_system()
 {
     ESP_LOGI(TAG, "🧹 システムクリーンアップ開始");
+
+    // ステータスLED無効化
+    enable_status_led(false);
 
     // オブジェクト削除
     if (g_encoder)
@@ -1052,7 +1271,7 @@ extern "C" void app_main()
     ESP_LOGI(TAG, "\n\n");
     ESP_LOGI(TAG, "╔══════════════════════════════════════════════╗");
     ESP_LOGI(TAG, "║  📸 ピクセルアートカメラ ESP-IDF 5.4版 📸  ║");
-    ESP_LOGI(TAG, "║          🎨 8色パレット対応にゃ！ 🎨         ║");
+    ESP_LOGI(TAG, "║       🎨 8色パレット + ステータスLED 🎨      ║");
     ESP_LOGI(TAG, "╚══════════════════════════════════════════════╝");
     ESP_LOGI(TAG, "🔧 ESP-IDF Version: %s", esp_get_idf_version());
 
@@ -1078,6 +1297,7 @@ extern "C" void app_main()
     if (ret != ESP_OK)
     {
         ESP_LOGE(TAG, "❌ システム初期化失敗: %s", esp_err_to_name(ret));
+        set_system_status(SYSTEM_STATUS_ERROR);
         cleanup_system();
         return;
     }
@@ -1087,16 +1307,21 @@ extern "C" void app_main()
     if (ret != ESP_OK)
     {
         ESP_LOGE(TAG, "❌ タスク作成失敗");
+        set_system_status(SYSTEM_STATUS_ERROR);
         cleanup_system();
         return;
     }
 
     // システム準備完了
     g_system_ready = true;
+    set_system_status(SYSTEM_STATUS_READY); // 待機状態に移行
 
     // 準備完了通知（LED 3回点滅）
     ESP_LOGI(TAG, "\n🎉 ========================================");
     ESP_LOGI(TAG, "✅ システム準備完了にゃ！");
+    ESP_LOGI(TAG, "🎨 ステータスLED:");
+    ESP_LOGI(TAG, "  🔴 赤点滅: 操作禁止中（起動・撮影・保存）");
+    ESP_LOGI(TAG, "  🔵 青点灯: 操作可能（待機中）");
     ESP_LOGI(TAG, "🔘 ショートプレス: 選択パレットで撮影");
     ESP_LOGI(TAG, "🔘 ロングプレス(1秒): 全パレットで撮影");
     if (g_encoder && g_encoder->is_initialized())

@@ -64,7 +64,9 @@ void PimoroniEncoder::give_mutex() {
 // I2Cレジスタ読み取り（リトライ機能付き）にゃ
 // ========================================
 esp_err_t PimoroniEncoder::read_register(uint8_t reg, uint8_t *value, int retries) {
-    if (!_initialized || !_i2c_dev_handle || !value) {
+    // 初期化中でもI2Cハンドルがあれば読み取り可能にする
+    if (!_i2c_dev_handle || !value) {
+        ESP_LOGE(TAG, "❌ 無効なハンドルまたはバッファ");
         return ESP_ERR_INVALID_STATE;
     }
     
@@ -80,20 +82,23 @@ esp_err_t PimoroniEncoder::read_register(uint8_t reg, uint8_t *value, int retrie
         );
         
         if (ret == ESP_OK) {
+            ESP_LOGD(TAG, "✅ レジスタ読み取り成功: reg=0x%02X, value=0x%02X", reg, *value);
             break;  // 成功
         }
         
+        // エラーの詳細ログ
+        ESP_LOGW(TAG, "⚠️ レジスタ読み取りエラー: reg=0x%02X, attempt=%d, error=%s", 
+                 reg, attempt + 1, esp_err_to_name(ret));
+        
         // リトライの場合は少し待機
         if (attempt < retries) {
-            ESP_LOGW(TAG, "⚠️ I2C読み取りリトライ %d/%d (reg:0x%02X)", 
-                     attempt + 1, retries, reg);
-            vTaskDelay(pdMS_TO_TICKS(10));
+            vTaskDelay(pdMS_TO_TICKS(50));  // 待機時間を長めに
         }
     }
     
     if (ret != ESP_OK) {
         _i2c_error_count++;
-        ESP_LOGE(TAG, "❌ I2C読み取り失敗: reg=0x%02X, error=%s", 
+        ESP_LOGE(TAG, "❌ I2C読み取り最終失敗: reg=0x%02X, error=%s", 
                  reg, esp_err_to_name(ret));
     }
     
@@ -187,7 +192,6 @@ esp_err_t PimoroniEncoder::setup_pwm() {
         write_register(REG_PWM_CONTROL, 2), 
         TAG, "PWM制御設定失敗"
     );
-    */
     
     // 少し待機してから次の設定
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -199,6 +203,7 @@ esp_err_t PimoroniEncoder::setup_pwm() {
     
     // LEDを初期化（消灯）
     led_off();
+    */
     
     ESP_LOGI(TAG, "✅ PWMセットアップ完了");
     return ESP_OK;
@@ -244,6 +249,63 @@ bool PimoroniEncoder::is_device_connected() {
 }
 
 // ========================================
+// より詳細なデバイステスト関数にゃ
+// ========================================
+esp_err_t PimoroniEncoder::test_device_communication() {
+    ESP_LOGI(TAG, "🧪 デバイス通信テスト開始");
+    
+    // テスト1: 単純な書き込みテスト
+    ESP_LOGI(TAG, "📝 テスト1: 書き込みテスト");
+    uint8_t test_reg = 0x11;  // エンコーダカウントレジスタ
+    uint8_t test_write_data = 0x00;
+    
+    esp_err_t ret = i2c_master_transmit(_i2c_dev_handle, 
+                                       (uint8_t[]){test_reg, test_write_data}, 2, 
+                                       2000);  // 2秒タイムアウト
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "✅ 書き込みテスト成功");
+    } else {
+        ESP_LOGW(TAG, "⚠️ 書き込みテスト失敗: %s", esp_err_to_name(ret));
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
+    // テスト2: 読み取りテスト
+    ESP_LOGI(TAG, "📖 テスト2: 読み取りテスト");
+    uint8_t read_data = 0;
+    
+    // 方法A: transmit_receive
+    ret = i2c_master_transmit_receive(_i2c_dev_handle, 
+                                     &test_reg, 1,
+                                     &read_data, 1, 
+                                     2000);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "✅ 方法A成功: レジスタ0x%02X = 0x%02X", test_reg, read_data);
+        return ESP_OK;
+    } else {
+        ESP_LOGW(TAG, "⚠️ 方法A失敗: %s", esp_err_to_name(ret));
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
+    // 方法B: 分離送信（古典的な方法）
+    ESP_LOGI(TAG, "📖 テスト3: 分離送信方式");
+    ret = i2c_master_transmit(_i2c_dev_handle, &test_reg, 1, 1000);
+    if (ret == ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        ret = i2c_master_receive(_i2c_dev_handle, &read_data, 1, 1000);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "✅ 方法B成功: レジスタ0x%02X = 0x%02X", test_reg, read_data);
+            return ESP_OK;
+        }
+    }
+    ESP_LOGW(TAG, "⚠️ 方法B失敗: %s", esp_err_to_name(ret));
+    
+    ESP_LOGE(TAG, "❌ 全ての通信テスト失敗");
+    return ESP_FAIL;
+}
+
+// ========================================
 // 初期化（ESP-IDF 5.4対応）にゃ
 // ========================================
 esp_err_t PimoroniEncoder::begin() {
@@ -263,12 +325,12 @@ esp_err_t PimoroniEncoder::begin() {
     
     // I2Cデバイス設定（ESP-IDF 5.4新API）
     i2c_device_config_t dev_cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,   // 7ビットアドレス
-        .device_address = _i2c_address,          // デバイスアドレス
-        .scl_speed_hz = 400000,                  // 400kHz
-        .scl_wait_us = 0,                        // デフォルト待機時間
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = _i2c_address,
+        .scl_speed_hz = 100000,
+        .scl_wait_us = 2000,
         .flags = {
-            .disable_ack_check = false,          // ACKチェック有効
+            .disable_ack_check = false,
         },
     };
     
@@ -280,37 +342,38 @@ esp_err_t PimoroniEncoder::begin() {
         return ret;
     }
     
-    vTaskDelay(pdMS_TO_TICKS(100));
+    vTaskDelay(pdMS_TO_TICKS(200));
     
-    // デバイス存在確認
-    if (!is_device_connected()) {
-        ESP_LOGE(TAG, "❌ デバイスが見つかりません (I2Cアドレス: 0x%02X)", _i2c_address);
-        i2c_master_bus_rm_device(_i2c_dev_handle);
-        _i2c_dev_handle = NULL;
-        vSemaphoreDelete(_device_mutex);
-        _device_mutex = NULL;
+    // プローブテスト
+    ESP_LOGI(TAG, "🔍 デバイス存在確認テスト");
+    ret = i2c_master_probe(_i2c_bus_handle, _i2c_address, 2000);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "❌ プローブテスト失敗: %s", esp_err_to_name(ret));
+        end();
         return ESP_ERR_NOT_FOUND;
     }
+    ESP_LOGI(TAG, "✅ プローブテスト成功");
     
-    ESP_LOGI(TAG, "✅ デバイス検出 (I2Cアドレス: 0x%02X)", _i2c_address);
-    
-    // エンコーダのセットアップ
-    ret = setup_rotary_encoder();
+    // 詳細な通信テスト
+
+    ret = test_device_communication();
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "❌ エンコーダセットアップ失敗");
-        end();
-        return ret;
+        ESP_LOGW(TAG, "⚠️ 通信テスト失敗、基本機能のみで続行");
+        // 通信テスト失敗でも続行（一部機能のみ使用）
     }
+        
     
-    // PWMの設定（LED制御用）
-    ret = setup_pwm();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "❌ PWMセットアップ失敗");
-        end();
-        return ret;
-    }
-    
+    // この時点で初期化フラグを立てる
     _initialized = true;
+
+    test_all_leds();
+    
+    // エンコーダのセットアップ（エラーでも続行）
+    setup_rotary_encoder();
+    
+    // PWMの設定（エラーでも続行）
+    setup_pwm();
+    
     _last_update_time = esp_timer_get_time() / 1000;
     
     ESP_LOGI(TAG, "🎉 エンコーダ初期化完了にゃ！");
@@ -393,6 +456,7 @@ int16_t PimoroniEncoder::update() {
     
     // 変化があった場合のみ更新
     if (diff != 0) {
+        int16_t old_value = _current_value;
         _current_value += diff;
         
         // 範囲制限
@@ -402,8 +466,12 @@ int16_t PimoroniEncoder::update() {
         _last_encoder_value = signed_count;
         _last_update_time = esp_timer_get_time() / 1000;
         
-        ESP_LOGD(TAG, "🔄 エンコーダ更新: raw=%d, diff=%d, value=%d", 
-                 signed_count, diff, _current_value);
+        // エンコーダ変化ログ（重要！）
+        ESP_LOGI(TAG, "🎛️ エンコーダ変化: raw=%d, diff=%d, 値=%d→%d", 
+                 signed_count, diff, old_value, _current_value);
+    } else {
+        // 変化なしの場合は詳細ログ（デバッグ用）
+        ESP_LOGD(TAG, "🎛️ エンコーダ変化なし: raw=%d, 現在値=%d", signed_count, _current_value);
     }
     
     give_mutex();
@@ -440,29 +508,54 @@ void PimoroniEncoder::set_value(int16_t val) {
 void PimoroniEncoder::set_led(uint8_t r, uint8_t g, uint8_t b) {
     if (!_initialized || !take_mutex()) return;
     
+    // 値に変化がない場合はスキップ（無限ループ防止）
+    if (_current_r == r && _current_g == g && _current_b == b) {
+        give_mutex();
+        return;
+    }
+    
     _current_r = r;
     _current_g = g;
     _current_b = b;
     
     // 輝度を適用（0.0-1.0）
-    uint16_t red   = (uint16_t)(r * _brightness);
-    uint16_t green = (uint16_t)(g * _brightness);
-    uint16_t blue  = (uint16_t)(b * _brightness);
+    uint8_t red   = (uint8_t)(r * _brightness);
+    uint8_t green = (uint8_t)(g * _brightness);
+    uint8_t blue  = (uint8_t)(b * _brightness);
     
-    // PWM値に変換（0-65535の範囲）
-    // RGB Encoder Breakoutは反転論理（Common Anode）なので反転
-    uint16_t red_pwm   = 65535 - (red * 257);    // 255 * 257 = 65535
-    uint16_t green_pwm = 65535 - (green * 257);
-    uint16_t blue_pwm  = 65535 - (blue * 257);
+    ESP_LOGI(TAG, "🌈 LED設定: R=%d, G=%d, B=%d (輝度=%.2f)", red, green, blue, _brightness);
     
-    // PWM出力
-    set_pwm_output(PIN_RED, red_pwm);
-    set_pwm_output(PIN_GREEN, green_pwm);
-    set_pwm_output(PIN_BLUE, blue_pwm);
+    // 方法1: 通常値で試行
+    esp_err_t ret_r = write_register(REG_LED_RED, red, 2);
+    esp_err_t ret_g = write_register(REG_LED_GREEN, green, 2);
+    esp_err_t ret_b = write_register(REG_LED_BLUE, blue, 2);
+    
+    bool success = (ret_r == ESP_OK && ret_g == ESP_OK && ret_b == ESP_OK);
+    
+    if (success) {
+        ESP_LOGI(TAG, "✅ LED設定成功（通常値）");
+    } else {
+        ESP_LOGW(TAG, "⚠️ LED設定失敗、反転値で再試行");
+        
+        // 方法2: Common Anode用反転値で試行
+        uint8_t inv_red   = 255 - red;
+        uint8_t inv_green = 255 - green;
+        uint8_t inv_blue  = 255 - blue;
+        
+        ESP_LOGI(TAG, "🔄 反転値テスト: R=%d, G=%d, B=%d", inv_red, inv_green, inv_blue);
+        
+        ret_r = write_register(REG_LED_RED, inv_red, 2);
+        ret_g = write_register(REG_LED_GREEN, inv_green, 2);
+        ret_b = write_register(REG_LED_BLUE, inv_blue, 2);
+        
+        if (ret_r == ESP_OK && ret_g == ESP_OK && ret_b == ESP_OK) {
+            ESP_LOGI(TAG, "✅ LED設定成功（反転値）");
+        } else {
+            ESP_LOGE(TAG, "❌ LED設定完全失敗");
+        }
+    }
     
     give_mutex();
-    
-    ESP_LOGD(TAG, "🌈 LED設定: R=%d, G=%d, B=%d (輝度=%.2f)", r, g, b, _brightness);
 }
 
 // ========================================
@@ -530,28 +623,79 @@ esp_err_t PimoroniEncoder::reset_encoder_count() {
 esp_err_t PimoroniEncoder::test_all_leds() {
     if (!_initialized) return ESP_ERR_INVALID_STATE;
     
-    ESP_LOGI(TAG, "🧪 LEDテスト開始");
+    ESP_LOGI(TAG, "🧪 LED直接制御テスト開始");
     
-    // 各色を順番にテスト
-    const uint32_t test_colors[] = {
-        0xFF0000,  // 赤
-        0x00FF00,  // 緑
-        0x0000FF,  // 青
-        0xFFFF00,  // 黄
-        0xFF00FF,  // マゼンタ
-        0x00FFFF,  // シアン
-        0xFFFFFF,  // 白
+    // 各色を順番にテスト（直接レジスタ操作）
+    const struct {
+        uint8_t r, g, b;
+        const char* name;
+    } test_colors[] = {
+        {255, 0, 0, "赤"},
+        {0, 255, 0, "緑"},
+        {0, 0, 255, "青"},
+        {255, 255, 0, "黄"},
+        {255, 0, 255, "マゼンタ"},
+        {0, 255, 255, "シアン"},
+        {255, 255, 255, "白"},
+        {0, 0, 0, "消灯"}
     };
     
-    for (int i = 0; i < 7; i++) {
-        ESP_LOGI(TAG, "🔴 テスト色: 0x%06lX", test_colors[i]);
-        set_led_color(test_colors[i]);
-        vTaskDelay(pdMS_TO_TICKS(300));
+    for (int i = 0; i < 8; i++) {
+        ESP_LOGI(TAG, "🔴 テスト色: %s (R=%d, G=%d, B=%d)", 
+                 test_colors[i].name, test_colors[i].r, test_colors[i].g, test_colors[i].b);
+        
+        // 直接レジスタに書き込み
+        write_register(REG_LED_RED, test_colors[i].r, 1);
+        write_register(REG_LED_GREEN, test_colors[i].g, 1);
+        write_register(REG_LED_BLUE, test_colors[i].b, 1);
+        
+        vTaskDelay(pdMS_TO_TICKS(500));  // 500ms待機
     }
     
-    led_off();
     ESP_LOGI(TAG, "✅ LEDテスト完了");
+
+        ESP_LOGI(TAG, "🧪 LEDレジスタ詳細テスト開始");
     
+    // 各レジスタの読み取りテスト
+    uint8_t red_val = 0, green_val = 0, blue_val = 0;
+    
+    esp_err_t ret_r = read_register(REG_LED_RED, &red_val, 3);
+    esp_err_t ret_g = read_register(REG_LED_GREEN, &green_val, 3);
+    esp_err_t ret_b = read_register(REG_LED_BLUE, &blue_val, 3);
+    
+    ESP_LOGI(TAG, "📖 LEDレジスタ読み取り結果:");
+    ESP_LOGI(TAG, "  赤(0x%02X): %s = 0x%02X", REG_LED_RED, 
+             ret_r == ESP_OK ? "成功" : "失敗", red_val);
+    ESP_LOGI(TAG, "  緑(0x%02X): %s = 0x%02X", REG_LED_GREEN, 
+             ret_g == ESP_OK ? "成功" : "失敗", green_val);
+    ESP_LOGI(TAG, "  青(0x%02X): %s = 0x%02X", REG_LED_BLUE, 
+             ret_b == ESP_OK ? "成功" : "失敗", blue_val);
+    
+    // 簡単な書き込みテスト
+    ESP_LOGI(TAG, "✏️ LEDレジスタ書き込みテスト");
+    
+    // 赤を最大値に設定
+    if (write_register(REG_LED_RED, 255, 3) == ESP_OK) {
+        ESP_LOGI(TAG, "✅ 赤レジスタ書き込み成功");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        write_register(REG_LED_RED, 0, 1); // 消灯
+    }
+    
+    // 緑を最大値に設定
+    if (write_register(REG_LED_GREEN, 255, 3) == ESP_OK) {
+        ESP_LOGI(TAG, "✅ 緑レジスタ書き込み成功");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        write_register(REG_LED_GREEN, 0, 1); // 消灯
+    }
+    
+    // 青を最大値に設定
+    if (write_register(REG_LED_BLUE, 255, 3) == ESP_OK) {
+        ESP_LOGI(TAG, "✅ 青レジスタ書き込み成功");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        write_register(REG_LED_BLUE, 0, 1); // 消灯
+    }
+    
+
     return ESP_OK;
 }
 
