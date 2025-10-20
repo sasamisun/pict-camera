@@ -1,104 +1,246 @@
 /*
- * SSD1306 OLED ディスプレイ制御クラス (ESP-IDF 5.4対応)
- * ピクセルアートカメラ プレビュー表示用にゃ
- * 
- * 機能:
- * - 128x64 SSD1306 OLEDディスプレイ制御
- * - カメラプレビュー画像の表示
- * - 自動サイズ変更と減色処理
- * - I2C共有（エンコーダと同じバス使用）
- * 
- * 作成者: にゃんにゃんプログラマー
+ * SSD1306 OLED ディスプレイ制御クラス 実装ファイル (レガシーI2C統一版)
+ * ESP-IDF 5.4対応 + ピクセルアートカメラ プレビュー表示用
  */
 
 #include "ssd1306_display.h"
 #include <string.h>
-#include <math.h>
-#include "esp_log.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
+#include <stdio.h>
+#include "esp_timer.h"
 
-static const char *TAG = "SSD1306";
+static const char* TAG = "SSD1306Display";
 
-// ========================================
-// SSD1306コマンド定義にゃ
-// ========================================
-#define SSD1306_CONTROL_CMD_SINGLE    0x80
-#define SSD1306_CONTROL_CMD_STREAM    0x00
-#define SSD1306_CONTROL_DATA_STREAM   0x40
-
-// 基本コマンド
-#define SSD1306_CMD_SET_CHARGE_PUMP   0x8D
-#define SSD1306_CMD_SET_SEGMENT_REMAP 0xA1
-#define SSD1306_CMD_SET_MUX_RATIO     0xA8
-#define SSD1306_CMD_SET_COM_SCAN_MODE 0xC8
-#define SSD1306_CMD_SET_DISP_OFFSET   0xD3
-#define SSD1306_CMD_SET_COM_PIN_MAP   0xDA
-#define SSD1306_CMD_SET_DISP_CLK_DIV  0xD5
-#define SSD1306_CMD_SET_PRECHARGE     0xD9
-#define SSD1306_CMD_SET_VCOMH_DESELCT 0xDB
-#define SSD1306_CMD_SET_MEMORY_ADDR_MODE 0x20
-#define SSD1306_CMD_SET_HORI_ADDR_RANGE 0x21
-#define SSD1306_CMD_SET_VERT_ADDR_RANGE 0x22
-#define SSD1306_CMD_SET_DISP_ON       0xAF
-#define SSD1306_CMD_SET_DISP_OFF      0xAE
-#define SSD1306_CMD_SET_ENTIRE_DISP_ON 0xA5
-#define SSD1306_CMD_SET_NORM_DISP     0xA6
-#define SSD1306_CMD_SET_INVERT_DISP   0xA7
-#define SSD1306_CMD_SET_CONTRAST      0x81
-
-// 初期化シーケンス用のコマンド配列にゃ
-static const uint8_t ssd1306_init_sequence[] = {
-    SSD1306_CMD_SET_DISP_OFF,        // ディスプレイOFF
-    SSD1306_CMD_SET_MUX_RATIO, 63,   // 高さ64px設定
-    SSD1306_CMD_SET_DISP_OFFSET, 0,  // オフセットなし
-    0x40,                            // スタートライン = 0
-    SSD1306_CMD_SET_SEGMENT_REMAP,   // セグメントリマップ
-    SSD1306_CMD_SET_COM_SCAN_MODE,   // COM出力スキャン方向
-    SSD1306_CMD_SET_COM_PIN_MAP, 0x12, // COMピン設定
-    SSD1306_CMD_SET_CONTRAST, 0x7F,  // コントラスト中程度
-    SSD1306_CMD_SET_ENTIRE_DISP_ON,  // 全画面ON無効
-    SSD1306_CMD_SET_NORM_DISP,       // 通常表示（反転なし）
-    SSD1306_CMD_SET_DISP_CLK_DIV, 0x80, // クロック分周比
-    SSD1306_CMD_SET_CHARGE_PUMP, 0x14,  // チャージポンプON
-    SSD1306_CMD_SET_MEMORY_ADDR_MODE, 0x00, // 水平アドレッシングモード
-    SSD1306_CMD_SET_HORI_ADDR_RANGE, 0, 127, // 水平範囲: 0-127
-    SSD1306_CMD_SET_VERT_ADDR_RANGE, 0, 7,   // 垂直範囲: 0-7 (8ページ)
-    SSD1306_CMD_SET_DISP_ON          // ディスプレイON
+// 8x8 簡易フォント（英数字のみ）
+static const uint8_t font_8x8[][8] = {
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, // 空白
+    {0x3E, 0x51, 0x49, 0x45, 0x3E, 0x00, 0x00, 0x00}, // 0
+    {0x00, 0x42, 0x7F, 0x40, 0x00, 0x00, 0x00, 0x00}, // 1
+    {0x42, 0x61, 0x51, 0x49, 0x46, 0x00, 0x00, 0x00}, // 2
+    {0x21, 0x41, 0x45, 0x4B, 0x31, 0x00, 0x00, 0x00}, // 3
+    {0x18, 0x14, 0x12, 0x7F, 0x10, 0x00, 0x00, 0x00}, // 4
+    {0x27, 0x45, 0x45, 0x45, 0x39, 0x00, 0x00, 0x00}, // 5
+    {0x3C, 0x4A, 0x49, 0x49, 0x30, 0x00, 0x00, 0x00}, // 6
+    {0x01, 0x71, 0x09, 0x05, 0x03, 0x00, 0x00, 0x00}, // 7
+    {0x36, 0x49, 0x49, 0x49, 0x36, 0x00, 0x00, 0x00}, // 8
+    {0x06, 0x49, 0x49, 0x29, 0x1E, 0x00, 0x00, 0x00}, // 9
+    // A-Z（簡略版）
+    {0x7E, 0x11, 0x11, 0x11, 0x7E, 0x00, 0x00, 0x00}, // A
+    {0x7F, 0x49, 0x49, 0x49, 0x36, 0x00, 0x00, 0x00}, // B
+    {0x3E, 0x41, 0x41, 0x41, 0x22, 0x00, 0x00, 0x00}, // C
+    // ... 他の文字は必要に応じて追加
 };
 
 // ========================================
-// コンストラクタ/デストラクタにゃ
+// コンストラクタ（レガシードライバー版）
 // ========================================
-SSD1306Display::SSD1306Display(i2c_master_bus_handle_t i2c_bus, uint8_t address)
-    : _i2c_bus_handle(i2c_bus)
-    , _i2c_dev_handle(nullptr)
+SSD1306Display::SSD1306Display(i2c_port_t i2c_port, uint8_t address)
+    : _i2c_port(i2c_port)
     , _i2c_address(address)
     , _initialized(false)
+    , _frame_buffer(nullptr)
     , _display_mutex(nullptr)
-    , _buffer(nullptr)
+    , _i2c_error_count(0)
+    , _update_count(0)
 {
-    ESP_LOGI(TAG, "🖥️ SSD1306ディスプレイオブジェクト作成: アドレス 0x%02X", address);
+    ESP_LOGD(TAG, "SSD1306Display オブジェクト作成: ポート=%d, アドレス=0x%02X", 
+             _i2c_port, _i2c_address);
 }
 
-SSD1306Display::~SSD1306Display() {
+// ========================================
+// デストラクタ
+// ========================================
+SSD1306Display::~SSD1306Display() 
+{
     end();
+    ESP_LOGD(TAG, "SSD1306Display オブジェクト削除完了");
 }
 
 // ========================================
-// 初期化処理にゃ
+// コマンド送信（レガシードライバー版）
 // ========================================
-esp_err_t SSD1306Display::begin() {
-    ESP_LOGI(TAG, "🔧 SSD1306初期化開始にゃ");
+esp_err_t SSD1306Display::write_command(uint8_t cmd, int retries) 
+{
+    if (!_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t ret = ESP_FAIL;
     
-    if (_initialized) {
-        ESP_LOGW(TAG, "⚠️ 既に初期化済みです");
-        return ESP_OK;
+    for (int attempt = 0; attempt < retries; attempt++) {
+        // コマンドリンク作成
+        i2c_cmd_handle_t cmd_handle = i2c_cmd_link_create();
+        if (!cmd_handle) {
+            _i2c_error_count++;
+            return ESP_ERR_NO_MEM;
+        }
+
+        // コマンド送信（制御バイト 0x00 + コマンド）
+        i2c_master_start(cmd_handle);
+        i2c_master_write_byte(cmd_handle, (_i2c_address << 1) | I2C_MASTER_WRITE, true);
+        i2c_master_write_byte(cmd_handle, 0x00, true);  // 制御バイト（コマンド）
+        i2c_master_write_byte(cmd_handle, cmd, true);   // コマンドデータ
+        i2c_master_stop(cmd_handle);
+        
+        // 実行
+        ret = i2c_master_cmd_begin(_i2c_port, cmd_handle, SSD1306_I2C_TIMEOUT_MS / portTICK_PERIOD_MS);
+        i2c_cmd_link_delete(cmd_handle);
+        
+        if (ret == ESP_OK) {
+            ESP_LOGV(TAG, "コマンド送信成功: 0x%02X", cmd);
+            break;
+        } else {
+            ESP_LOGW(TAG, "コマンド送信失敗 (試行%d/%d): 0x%02X, エラー: %s", 
+                     attempt + 1, retries, cmd, esp_err_to_name(ret));
+            _i2c_error_count++;
+            
+            if (attempt < retries - 1) {
+                vTaskDelay(pdMS_TO_TICKS(5));  // リトライ間隔
+            }
+        }
     }
     
-    if (!_i2c_bus_handle) {
-        ESP_LOGE(TAG, "❌ I2Cバスハンドルが無効です");
+    return ret;
+}
+
+// ========================================
+// データ送信（レガシードライバー版）
+// ========================================
+esp_err_t SSD1306Display::write_data(const uint8_t* data, size_t len, int retries) 
+{
+    if (!_initialized || !data || len == 0) {
         return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t ret = ESP_FAIL;
+    
+    for (int attempt = 0; attempt < retries; attempt++) {
+        // コマンドリンク作成
+        i2c_cmd_handle_t cmd_handle = i2c_cmd_link_create();
+        if (!cmd_handle) {
+            _i2c_error_count++;
+            return ESP_ERR_NO_MEM;
+        }
+
+        // データ送信（制御バイト 0x40 + データ）
+        i2c_master_start(cmd_handle);
+        i2c_master_write_byte(cmd_handle, (_i2c_address << 1) | I2C_MASTER_WRITE, true);
+        i2c_master_write_byte(cmd_handle, 0x40, true);  // 制御バイト（データ）
+        i2c_master_write(cmd_handle, data, len, true);  // データ
+        i2c_master_stop(cmd_handle);
+        
+        // 実行
+        ret = i2c_master_cmd_begin(_i2c_port, cmd_handle, SSD1306_I2C_TIMEOUT_MS / portTICK_PERIOD_MS);
+        i2c_cmd_link_delete(cmd_handle);
+        
+        if (ret == ESP_OK) {
+            ESP_LOGV(TAG, "データ送信成功: %zu bytes", len);
+            break;
+        } else {
+            ESP_LOGW(TAG, "データ送信失敗 (試行%d/%d): %zu bytes, エラー: %s", 
+                     attempt + 1, retries, len, esp_err_to_name(ret));
+            _i2c_error_count++;
+            
+            if (attempt < retries - 1) {
+                vTaskDelay(pdMS_TO_TICKS(5));  // リトライ間隔
+            }
+        }
+    }
+    
+    return ret;
+}
+
+// ========================================
+// デバイス接続確認（レガシードライバー版）
+// ========================================
+esp_err_t SSD1306Display::probe_device() 
+{
+    ESP_LOGD(TAG, "デバイス接続確認: 0x%02X", _i2c_address);
+    
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    if (!cmd) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (_i2c_address << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_stop(cmd);
+    
+    esp_err_t ret = i2c_master_cmd_begin(_i2c_port, cmd, 100 / portTICK_PERIOD_MS);
+    i2c_cmd_link_delete(cmd);
+    
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "✅ SSD1306デバイス検出成功: 0x%02X", _i2c_address);
+    } else {
+        ESP_LOGW(TAG, "❌ SSD1306デバイス検出失敗: 0x%02X, エラー: %s", 
+                 _i2c_address, esp_err_to_name(ret));
+        _i2c_error_count++;
+    }
+    
+    return ret;
+}
+
+// ========================================
+// 初期化シーケンス送信
+// ========================================
+esp_err_t SSD1306Display::send_init_sequence() 
+{
+    ESP_LOGD(TAG, "SSD1306初期化シーケンス送信開始");
+    
+    // 初期化コマンドシーケンス
+    const uint8_t init_commands[] = {
+        SSD1306_CMD_DISPLAY_OFF,        // ディスプレイOFF
+        SSD1306_CMD_SET_DISPLAY_CLOCK,  // クロック設定
+        0x80,                           // 推奨値
+        SSD1306_CMD_SET_MULTIPLEX,      // マルチプレックス設定
+        0x3F,                           // 64MUX（64行）
+        SSD1306_CMD_SET_DISPLAY_OFFSET, // ディスプレイオフセット
+        0x00,                           // オフセット無し
+        SSD1306_CMD_SET_START_LINE,     // 開始行設定
+        SSD1306_CMD_CHARGE_PUMP,        // チャージポンプ設定
+        0x14,                           // 内蔵VCC使用
+        SSD1306_CMD_MEMORY_MODE,        // メモリアドレッシングモード
+        0x00,                           // 水平アドレッシングモード
+        SSD1306_CMD_SEG_REMAP,          // セグメントリマップ
+        SSD1306_CMD_COM_SCAN_DEC,       // COM出力スキャン方向
+        SSD1306_CMD_SET_COM_PINS,       // COMピン設定
+        0x12,                           // 代替COMピン設定
+        SSD1306_CMD_SET_CONTRAST,       // コントラスト設定
+        0xCF,                           // 初期コントラスト値
+        SSD1306_CMD_SET_PRECHARGE,      // プリチャージ期間
+        0xF1,                           // プリチャージ期間設定
+        SSD1306_CMD_SET_VCOM_DETECT,    // VCOMH設定
+        0x40,                           // VCOMH設定値
+        SSD1306_CMD_DISPLAY_ALL_ON_RESUME, // 全点灯解除
+        SSD1306_CMD_NORMAL_DISPLAY,     // 通常表示
+        SSD1306_CMD_DEACTIVATE_SCROLL,  // スクロール無効
+        SSD1306_CMD_DISPLAY_ON          // ディスプレイON
+    };
+    
+    // コマンドを順次送信
+    for (size_t i = 0; i < sizeof(init_commands); i++) {
+        esp_err_t ret = write_command(init_commands[i]);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "初期化コマンド送信失敗: 0x%02X at index %zu", 
+                     init_commands[i], i);
+            return ret;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));  // コマンド間隔
+    }
+    
+    ESP_LOGI(TAG, "✅ SSD1306初期化シーケンス送信完了");
+    return ESP_OK;
+}
+
+// ========================================
+// 初期化
+// ========================================
+esp_err_t SSD1306Display::begin() 
+{
+    ESP_LOGI(TAG, "🔧 SSD1306ディスプレイ初期化開始");
+    
+    if (_initialized) {
+        ESP_LOGW(TAG, "⚠️ 既に初期化済み");
+        return ESP_OK;
     }
     
     // ミューテックス作成
@@ -108,681 +250,399 @@ esp_err_t SSD1306Display::begin() {
         return ESP_ERR_NO_MEM;
     }
     
-    // フレームバッファ確保（128x64 = 1024バイト）
-    _buffer = (uint8_t*)malloc(SSD1306_WIDTH * SSD1306_HEIGHT / 8);
-    if (!_buffer) {
+    // フレームバッファ確保
+    _frame_buffer = (uint8_t*)calloc(SSD1306_BUFFER_SIZE, 1);
+    if (!_frame_buffer) {
         ESP_LOGE(TAG, "❌ フレームバッファ確保失敗");
         vSemaphoreDelete(_display_mutex);
         _display_mutex = nullptr;
         return ESP_ERR_NO_MEM;
     }
     
-    // バッファクリア
-    memset(_buffer, 0, SSD1306_WIDTH * SSD1306_HEIGHT / 8);
-    
-    // I2Cデバイス設定
-    i2c_device_config_t dev_cfg = {};
-    dev_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
-    dev_cfg.device_address = _i2c_address;
-    dev_cfg.scl_speed_hz = 100000; // 100kHzに下げる（SSD1306は高速通信で問題が出ることがある）
-    dev_cfg.scl_wait_us = 2000;    // 待機時間を増加
-    dev_cfg.flags.disable_ack_check = false;
-    
-    esp_err_t ret = i2c_master_bus_add_device(_i2c_bus_handle, &dev_cfg, &_i2c_dev_handle);
+    // デバイス接続確認
+    esp_err_t ret = probe_device();
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "❌ I2Cデバイス追加失敗: %s", esp_err_to_name(ret));
-        free(_buffer);
-        _buffer = nullptr;
-        vSemaphoreDelete(_display_mutex);
-        _display_mutex = nullptr;
+        ESP_LOGE(TAG, "❌ SSD1306デバイス接続確認失敗");
+        end();
         return ret;
     }
-    
-    // デバイス存在確認
-    ESP_LOGI(TAG, "🔍 SSD1306デバイス存在確認...");
-    ret = i2c_master_probe(_i2c_bus_handle, _i2c_address, 2000); // タイムアウト延長
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "❌ SSD1306デバイスが見つかりません (0x%02X): %s", 
-                 _i2c_address, esp_err_to_name(ret));
-        end();
-        return ESP_ERR_NOT_FOUND;
-    }
-    ESP_LOGI(TAG, "✅ SSD1306デバイス検出成功!");
-    
-    // 少し待機してからコマンド送信
-    vTaskDelay(pdMS_TO_TICKS(100));
     
     // 初期化シーケンス送信
-    ESP_LOGI(TAG, "📡 初期化コマンド送信中...");
     ret = send_init_sequence();
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "❌ 初期化シーケンス送信失敗");
+        ESP_LOGE(TAG, "❌ SSD1306初期化シーケンス失敗");
         end();
         return ret;
     }
     
-    // 初期化完了
     _initialized = true;
-    ESP_LOGI(TAG, "🎉 SSD1306初期化完了にゃ!");
     
-    // test - ディスプレイ動作確認用テストパターン
-    ESP_LOGI(TAG, "📺 テストパターン表示開始");
-    
-    // test - パターン1: 全画面クリア（黒）
+    // 初期画面表示
     clear();
-    update();
-    vTaskDelay(pdMS_TO_TICKS(500));
+    draw_string(0, 0, "SSD1306 Ready!");
+    draw_string(0, 2, "Pixel Art Cam");
+    display();
     
-    // test - パターン2: 全画面白
-    if (take_mutex()) {
-        memset(_buffer, 0xFF, SSD1306_WIDTH * SSD1306_HEIGHT / 8);
-        give_mutex();
-    }
-    update();
-    vTaskDelay(pdMS_TO_TICKS(500));
-    
-    // test - パターン3: チェッカーボードパターン
-    clear();
-    for (int y = 0; y < SSD1306_HEIGHT; y += 8) {
-        for (int x = 0; x < SSD1306_WIDTH; x += 8) {
-            if (((x / 8) + (y / 8)) % 2 == 0) {
-                draw_rect(x, y, 8, 8, true);
-            }
-        }
-    }
-    update();
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    
-    // test - パターン4: 縦線パターン
-    clear();
-    for (int x = 0; x < SSD1306_WIDTH; x += 8) {
-        for (int y = 0; y < SSD1306_HEIGHT; y++) {
-            draw_pixel(x, y, true);
-        }
-    }
-    update();
-    vTaskDelay(pdMS_TO_TICKS(500));
-    
-    // test - パターン5: 境界テスト（四角形の枠）
-    clear();
-    // 外枠
-    for (int x = 0; x < SSD1306_WIDTH; x++) {
-        draw_pixel(x, 0, true);                    // 上端
-        draw_pixel(x, SSD1306_HEIGHT-1, true);    // 下端
-    }
-    for (int y = 0; y < SSD1306_HEIGHT; y++) {
-        draw_pixel(0, y, true);                    // 左端
-        draw_pixel(SSD1306_WIDTH-1, y, true);     // 右端
-    }
-    // 中央の十字
-    int center_x = SSD1306_WIDTH / 2;
-    int center_y = SSD1306_HEIGHT / 2;
-    for (int x = 0; x < SSD1306_WIDTH; x++) {
-        draw_pixel(x, center_y, true);             // 水平線
-    }
-    for (int y = 0; y < SSD1306_HEIGHT; y++) {
-        draw_pixel(center_x, y, true);             // 垂直線
-    }
-    update();
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    
-    // test - 最終パターン: 通常の初期化メッセージ
-    clear();
-    draw_text(0, 0, "PixelArt Camera", 1);
-    draw_text(0, 16, "SSD1306 Ready!", 1);
-    draw_text(0, 32, "Waiting for", 1);
-    draw_text(0, 48, "camera preview...", 1);
-    update();
-    
-    ESP_LOGI(TAG, "✅ テストパターン表示完了");
-    
+    ESP_LOGI(TAG, "✅ SSD1306ディスプレイ初期化完了");
     return ESP_OK;
 }
 
 // ========================================
-// 終了処理にゃ
+// 終了処理
 // ========================================
-void SSD1306Display::end() {
-    if (!_initialized) return;
-    
-    ESP_LOGI(TAG, "🔚 SSD1306終了処理開始");
-    
-    _initialized = false;
-    
-    // ディスプレイOFF
-    if (_i2c_dev_handle) {
-        send_command(SSD1306_CMD_SET_DISP_OFF);
+void SSD1306Display::end() 
+{
+    if (_initialized) {
+        // ディスプレイOFF
+        write_command(SSD1306_CMD_DISPLAY_OFF);
+        _initialized = false;
     }
     
-    // I2Cデバイス削除
-    if (_i2c_dev_handle) {
-        i2c_master_bus_rm_device(_i2c_dev_handle);
-        _i2c_dev_handle = nullptr;
+    if (_frame_buffer) {
+        free(_frame_buffer);
+        _frame_buffer = nullptr;
     }
     
-    // バッファ解放
-    if (_buffer) {
-        free(_buffer);
-        _buffer = nullptr;
-    }
-    
-    // ミューテックス削除
     if (_display_mutex) {
         vSemaphoreDelete(_display_mutex);
         _display_mutex = nullptr;
     }
     
-    ESP_LOGI(TAG, "✅ SSD1306終了処理完了");
+    ESP_LOGI(TAG, "SSD1306ディスプレイ終了処理完了");
 }
 
 // ========================================
-// I2C通信：コマンド送信にゃ
+// フレームバッファクリア
 // ========================================
-esp_err_t SSD1306Display::send_command(uint8_t cmd) {
-    if (!_i2c_dev_handle) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    
-    uint8_t data[2] = {SSD1306_CONTROL_CMD_SINGLE, cmd};
-    esp_err_t ret = i2c_master_transmit(_i2c_dev_handle, data, 2, 1000);
-    
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "❌ コマンド送信失敗: 0x%02X, エラー: %s", cmd, esp_err_to_name(ret));
-    }
-    
-    return ret;
-}
-
-// ========================================
-// I2C通信：データ送信にゃ
-// ========================================
-esp_err_t SSD1306Display::send_data(const uint8_t* data, size_t len) {
-    if (!_initialized || !_i2c_dev_handle || !data || len == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    
-    // コントロールバイト + データの形式で送信
-    uint8_t* buffer = (uint8_t*)malloc(len + 1);
-    if (!buffer) {
-        return ESP_ERR_NO_MEM;
-    }
-    
-    buffer[0] = SSD1306_CONTROL_DATA_STREAM;
-    memcpy(&buffer[1], data, len);
-    
-    esp_err_t ret = i2c_master_transmit(_i2c_dev_handle, buffer, len + 1, 1000);
-    free(buffer);
-    
-    return ret;
-}
-
-// ========================================
-// 初期化シーケンス送信にゃ
-// ========================================
-esp_err_t SSD1306Display::send_init_sequence() {
-    ESP_LOGI(TAG, "📡 SSD1306初期化シーケンス開始");
-    
-    // より簡単な初期化シーケンスを使用
-    const uint8_t simple_init[] = {
-        SSD1306_CMD_SET_DISP_OFF,        // ディスプレイOFF
-        SSD1306_CMD_SET_MUX_RATIO, 63,   // 高さ64px設定
-        SSD1306_CMD_SET_DISP_OFFSET, 0,  // オフセットなし
-        0x40,                            // スタートライン = 0
-        SSD1306_CMD_SET_SEGMENT_REMAP,   // セグメントリマップ
-        SSD1306_CMD_SET_COM_SCAN_MODE,   // COM出力スキャン方向
-        SSD1306_CMD_SET_COM_PIN_MAP, 0x12, // COMピン設定
-        SSD1306_CMD_SET_CONTRAST, 0x7F,  // コントラスト中程度
-        SSD1306_CMD_SET_ENTIRE_DISP_ON,  // 全画面ON無効
-        SSD1306_CMD_SET_NORM_DISP,       // 通常表示
-        SSD1306_CMD_SET_DISP_CLK_DIV, 0x80, // クロック分周比
-        SSD1306_CMD_SET_CHARGE_PUMP, 0x14,  // チャージポンプON
-        SSD1306_CMD_SET_MEMORY_ADDR_MODE, 0x00, // 水平アドレッシングモード
-        SSD1306_CMD_SET_DISP_ON          // ディスプレイON
-    };
-    
-    for (size_t i = 0; i < sizeof(simple_init); i++) {
-        esp_err_t ret = send_command(simple_init[i]);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "❌ 初期化コマンド送信失敗 [%zu]: 0x%02X", i, simple_init[i]);
-            return ret;
-        }
-        vTaskDelay(pdMS_TO_TICKS(2)); // 少し長めの待機
-        
-        // デバッグ用：成功したコマンドをログ出力
-        ESP_LOGD(TAG, "✅ コマンド送信成功 [%zu]: 0x%02X", i, simple_init[i]);
-    }
-    
-    ESP_LOGI(TAG, "✅ 初期化シーケンス完了");
-    return ESP_OK;
-}
-
-// ========================================
-// フレームバッファクリアにゃ
-// ========================================
-void SSD1306Display::clear() {
-    if (!_buffer) return;
-    
-    if (take_mutex()) {
-        memset(_buffer, 0, SSD1306_WIDTH * SSD1306_HEIGHT / 8);
-        give_mutex();
-    }
-}
-
-// ========================================
-// ピクセル描画にゃ
-// ========================================
-void SSD1306Display::draw_pixel(int16_t x, int16_t y, bool color) {
-    if (!_buffer || x < 0 || x >= SSD1306_WIDTH || y < 0 || y >= SSD1306_HEIGHT) {
+void SSD1306Display::clear() 
+{
+    if (!_initialized || !_frame_buffer) {
         return;
     }
     
-    if (take_mutex()) {
-        uint16_t byte_index = x + (y / 8) * SSD1306_WIDTH;
-        uint8_t bit_mask = 1 << (y % 8);
+    if (xSemaphoreTake(_display_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        memset(_frame_buffer, 0, SSD1306_BUFFER_SIZE);
+        xSemaphoreGive(_display_mutex);
+    }
+}
+
+// ========================================
+// ピクセル設定
+// ========================================
+void SSD1306Display::set_pixel(int x, int y, bool color) 
+{
+    if (!_initialized || !_frame_buffer) {
+        return;
+    }
+    
+    if (x < 0 || x >= SSD1306_WIDTH || y < 0 || y >= SSD1306_HEIGHT) {
+        return;
+    }
+    
+    if (xSemaphoreTake(_display_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        int byte_index = x + (y / 8) * SSD1306_WIDTH;
+        int bit_index = y % 8;
         
         if (color) {
-            _buffer[byte_index] |= bit_mask;  // ピクセルON
+            _frame_buffer[byte_index] |= (1 << bit_index);
         } else {
-            _buffer[byte_index] &= ~bit_mask; // ピクセルOFF
+            _frame_buffer[byte_index] &= ~(1 << bit_index);
         }
         
-        give_mutex();
+        xSemaphoreGive(_display_mutex);
     }
 }
 
 // ========================================
-// 矩形描画にゃ
+// ディスプレイ更新
 // ========================================
-void SSD1306Display::draw_rect(int16_t x, int16_t y, int16_t w, int16_t h, bool color) {
-    for (int16_t i = 0; i < w; i++) {
-        for (int16_t j = 0; j < h; j++) {
-            draw_pixel(x + i, y + j, color);
-        }
-    }
-}
-
-// ========================================
-// 簡易フォント（8x8ピクセル）にゃ
-// ========================================
-static const uint8_t font_8x8[][8] = {
-    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, // (space)
-    {0x3E, 0x51, 0x49, 0x45, 0x3E, 0x00, 0x00, 0x00}, // A
-    {0x7F, 0x49, 0x49, 0x49, 0x36, 0x00, 0x00, 0x00}, // B
-    {0x3E, 0x41, 0x41, 0x41, 0x22, 0x00, 0x00, 0x00}, // C
-    {0x7F, 0x41, 0x41, 0x22, 0x1C, 0x00, 0x00, 0x00}, // D
-    {0x7F, 0x49, 0x49, 0x49, 0x41, 0x00, 0x00, 0x00}, // E
-    {0x7F, 0x09, 0x09, 0x09, 0x01, 0x00, 0x00, 0x00}, // F
-    // ... 他の文字も必要に応じて追加
-};
-
-// ========================================
-// テキスト描画にゃ
-// ========================================
-void SSD1306Display::draw_text(int16_t x, int16_t y, const char* text, uint8_t size) {
-    if (!text) return;
-    
-    int16_t cursor_x = x;
-    int16_t cursor_y = y;
-    
-    while (*text) {
-        char c = *text++;
-        
-        // 基本的な文字のみサポート（簡易実装）
-        if (c >= 'A' && c <= 'F') {
-            uint8_t char_index = c - 'A' + 1; // font_8x8配列のインデックス
-            draw_char(cursor_x, cursor_y, char_index, size);
-        } else if (c == ' ') {
-            draw_char(cursor_x, cursor_y, 0, size); // スペース
-        } else {
-            // サポートしない文字は・で表示
-            draw_rect(cursor_x + 3, cursor_y + 3, 2, 2, true);
-        }
-        
-        cursor_x += 8 * size; // 次の文字位置
-        
-        // 行末で折り返し
-        if (cursor_x + 8 * size > SSD1306_WIDTH) {
-            cursor_x = x;
-            cursor_y += 8 * size;
-        }
-    }
-}
-
-// ========================================
-// 文字描画（8x8フォント）にゃ
-// ========================================
-void SSD1306Display::draw_char(int16_t x, int16_t y, uint8_t char_index, uint8_t size) {
-    if (char_index >= sizeof(font_8x8) / sizeof(font_8x8[0])) {
-        return;
-    }
-    
-    const uint8_t* char_data = font_8x8[char_index];
-    
-    for (int i = 0; i < 8; i++) {
-        uint8_t line = char_data[i];
-        for (int j = 0; j < 8; j++) {
-            if (line & (0x80 >> j)) {
-                // サイズに応じて拡大描画
-                for (int sx = 0; sx < size; sx++) {
-                    for (int sy = 0; sy < size; sy++) {
-                        draw_pixel(x + j * size + sx, y + i * size + sy, true);
-                    }
-                }
-            }
-        }
-    }
-}
-
-// ========================================
-// フレームバッファをディスプレイに転送にゃ
-// ========================================
-esp_err_t SSD1306Display::update() {
-    if (!_initialized || !_buffer) {
+esp_err_t SSD1306Display::display() 
+{
+    if (!_initialized || !_frame_buffer) {
         return ESP_ERR_INVALID_STATE;
     }
     
     esp_err_t ret = ESP_OK;
     
-    if (take_mutex()) {
-        // アドレス範囲設定
-        ret = send_command(SSD1306_CMD_SET_HORI_ADDR_RANGE);
-        if (ret == ESP_OK) ret = send_command(0); // 開始列
-        if (ret == ESP_OK) ret = send_command(127); // 終了列
+    if (xSemaphoreTake(_display_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        // 列アドレス設定
+        ret = write_command(SSD1306_CMD_SET_COLUMN_ADDR);
+        if (ret == ESP_OK) ret = write_command(0);      // 開始列
+        if (ret == ESP_OK) ret = write_command(127);    // 終了列
         
-        ret = send_command(SSD1306_CMD_SET_VERT_ADDR_RANGE);
-        if (ret == ESP_OK) ret = send_command(0); // 開始ページ
-        if (ret == ESP_OK) ret = send_command(7); // 終了ページ
+        // ページアドレス設定
+        if (ret == ESP_OK) ret = write_command(SSD1306_CMD_SET_PAGE_ADDR);
+        if (ret == ESP_OK) ret = write_command(0);      // 開始ページ
+        if (ret == ESP_OK) ret = write_command(7);      // 終了ページ
         
-        // フレームバッファ全体を送信
+        // フレームバッファ送信
         if (ret == ESP_OK) {
-            ret = send_data(_buffer, SSD1306_WIDTH * SSD1306_HEIGHT / 8);
+            ret = write_data(_frame_buffer, SSD1306_BUFFER_SIZE);
         }
         
-        give_mutex();
+        if (ret == ESP_OK) {
+            _update_count++;
+        }
+        
+        xSemaphoreGive(_display_mutex);
     } else {
         ret = ESP_ERR_TIMEOUT;
     }
     
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "❌ ディスプレイ更新失敗: %s", esp_err_to_name(ret));
-    }
-    
     return ret;
 }
 
 // ========================================
-// カメラプレビュー表示にゃ
+// 簡易文字列描画
 // ========================================
-esp_err_t SSD1306Display::show_camera_preview(camera_fb_t* fb) {
-    if (!_initialized || !fb || !fb->buf) {
-        // test - エラー原因の詳細ログ
-        if (!_initialized) {
-            ESP_LOGE(TAG, "❌ ディスプレイが初期化されていません");
+void SSD1306Display::draw_string(int x, int y, const char* text) 
+{
+    if (!text || !_initialized) {
+        return;
+    }
+    
+    int char_x = x * 8;  // 文字幅8ピクセル
+    int char_y = y * 8;  // 文字高8ピクセル
+    
+    for (int i = 0; text[i] != '\0' && (char_x + i * 8) < SSD1306_WIDTH; i++) {
+        char c = text[i];
+        const uint8_t* font_data = nullptr;
+        
+        // フォントデータ選択（簡易版）
+        if (c >= '0' && c <= '9') {
+            font_data = font_8x8[c - '0' + 1];  // 0-9
+        } else if (c >= 'A' && c <= 'C') {
+            font_data = font_8x8[c - 'A' + 11]; // A-C（簡略版）
+        } else {
+            font_data = font_8x8[0];  // 空白
         }
-        if (!fb) {
-            ESP_LOGE(TAG, "❌ フレームバッファがnullです");
+        
+        // 8x8ピクセルで文字描画
+        for (int px = 0; px < 8; px++) {
+            for (int py = 0; py < 8; py++) {
+                bool pixel = (font_data[py] >> (7 - px)) & 1;
+                set_pixel(char_x + i * 8 + px, char_y + py, pixel);
+            }
         }
-        if (fb && !fb->buf) {
-            ESP_LOGE(TAG, "❌ フレームバッファのデータがnullです");
+    }
+}
+
+// ========================================
+// 行単位テキスト表示
+// ========================================
+void SSD1306Display::print_line(int line, const char* text) 
+{
+    if (line < 0 || line >= 8) {
+        return;
+    }
+    
+    // 該当行をクリア
+    int start_y = line * 8;
+    for (int y = start_y; y < start_y + 8; y++) {
+        for (int x = 0; x < SSD1306_WIDTH; x++) {
+            set_pixel(x, y, false);
         }
+    }
+    
+    // テキスト描画
+    draw_string(0, line, text);
+}
+
+// ========================================
+// カメラプレビュー表示
+// ========================================
+esp_err_t SSD1306Display::show_camera_preview(camera_fb_t* fb, int x, int y, 
+                                               int width, int height) 
+{
+    if (!fb || !_initialized || !_frame_buffer) {
         return ESP_ERR_INVALID_ARG;
     }
     
-    ESP_LOGI(TAG, "📷 カメラプレビュー表示開始");
-    ESP_LOGI(TAG, "  原画像: %dx%d, format: %d", fb->width, fb->height, fb->format);
-    
-    // 現在はRGB565フォーマットのみサポート
     if (fb->format != PIXFORMAT_RGB565) {
-        ESP_LOGE(TAG, "❌ サポートしていない画像フォーマット: %d", fb->format);
-        ESP_LOGI(TAG, "💡 PIXFORMAT_RGB565 (%d) が必要です", PIXFORMAT_RGB565);
+        ESP_LOGW(TAG, "⚠️ RGB565以外のフォーマット: %d", fb->format);
         return ESP_ERR_NOT_SUPPORTED;
     }
     
-    // test - フレームバッファの状態確認
-    ESP_LOGI(TAG, "📊 フレームバッファ詳細:");
-    ESP_LOGI(TAG, "  データ長: %zu bytes", fb->len);
-    ESP_LOGI(TAG, "  期待サイズ: %d bytes", fb->width * fb->height * 2); // RGB565は2バイト/ピクセル
-    ESP_LOGI(TAG, "  タイムスタンプ: %llu", fb->timestamp.tv_sec * 1000000ULL + fb->timestamp.tv_usec);
-    
-    // test - データ破損チェック
-    if (fb->len != fb->width * fb->height * 2) {
-        ESP_LOGW(TAG, "⚠️ フレームバッファサイズが不正です");
-        ESP_LOGW(TAG, "  実際: %zu bytes, 期待: %d bytes", fb->len, fb->width * fb->height * 2);
+    // 範囲チェック
+    if (x < 0 || y < 0 || (x + width) > SSD1306_WIDTH || (y + height) > SSD1306_HEIGHT) {
+        ESP_LOGW(TAG, "⚠️ プレビュー範囲が画面外: (%d,%d)+(%dx%d)", x, y, width, height);
+        return ESP_ERR_INVALID_ARG;
     }
     
-    clear(); // 画面クリア
+    // RGB565データをモノクロに変換してリサイズ
+    rgb565_to_mono_resize(fb->buf, fb->width, fb->height, 
+                          _frame_buffer, width, height);
     
-    // RGB565をモノクロに変換してSSD1306に適したサイズにリサイズ
-    esp_err_t ret = convert_and_resize_rgb565(fb);
+    ESP_LOGD(TAG, "カメラプレビュー表示: %dx%d → %dx%d", 
+             fb->width, fb->height, width, height);
     
+    return display();
+}
+
+// ========================================
+// RGB565 → モノクロ変換 + リサイズ
+// ========================================
+void SSD1306Display::rgb565_to_mono_resize(const uint8_t* rgb565_data, int src_width, int src_height,
+                                            uint8_t* mono_buffer, int dst_width, int dst_height) 
+{
+    if (!rgb565_data || !mono_buffer) {
+        return;
+    }
+    
+    const uint16_t* rgb565 = (const uint16_t*)rgb565_data;
+    
+    for (int dst_y = 0; dst_y < dst_height; dst_y++) {
+        for (int dst_x = 0; dst_x < dst_width; dst_x++) {
+            // ソース座標計算（最近傍補間）
+            int src_x = (dst_x * src_width) / dst_width;
+            int src_y = (dst_y * src_height) / dst_height;
+            
+            if (src_x >= src_width) src_x = src_width - 1;
+            if (src_y >= src_height) src_y = src_height - 1;
+            
+            // RGB565からRGB成分抽出
+            uint16_t pixel = rgb565[src_y * src_width + src_x];
+            uint8_t r = (pixel >> 11) & 0x1F;
+            uint8_t g = (pixel >> 5) & 0x3F;
+            uint8_t b = pixel & 0x1F;
+            
+            // グレースケール変換（輝度計算）
+            uint8_t gray = (r * 299 + g * 587 + b * 114) / 1000;
+            
+            // 二値化（閾値: 128）
+            bool pixel_on = gray > 15;  // RGB565での中間値
+            
+            // フレームバッファに設定
+            set_pixel(dst_x, dst_y, pixel_on);
+        }
+    }
+}
+
+// ========================================
+// パレット情報表示
+// ========================================
+void SSD1306Display::show_palette_info(int palette_index, const char* palette_name) 
+{
+    char info_text[32];
+    snprintf(info_text, sizeof(info_text), "Palette: %d", palette_index);
+    
+    print_line(7, info_text);  // 最下行に表示
+    
+    if (palette_name) {
+        print_line(6, palette_name);  // パレット名も表示
+    }
+}
+
+// ========================================
+// 通信テスト
+// ========================================
+esp_err_t SSD1306Display::test_communication() 
+{
+    ESP_LOGI(TAG, "🧪 SSD1306通信テスト開始");
+    
+    esp_err_t ret = probe_device();
     if (ret == ESP_OK) {
-        // test - 更新前のフレームバッファ状態をサンプリング
-        ESP_LOGI(TAG, "🖥️ ディスプレイ更新前の状態:");
-        if (take_mutex()) {
-            int sample_pixels = 0;
-            int white_count = 0;
-            // 画面の数箇所をサンプリング
-            for (int y = 0; y < SSD1306_HEIGHT; y += 16) {
-                for (int x = 0; x < SSD1306_WIDTH; x += 16) {
-                    uint16_t byte_index = x + (y / 8) * SSD1306_WIDTH;
-                    uint8_t bit_mask = 1 << (y % 8);
-                    bool pixel_on = (_buffer[byte_index] & bit_mask) != 0;
-                    if (pixel_on) white_count++;
-                    sample_pixels++;
+        ESP_LOGI(TAG, "✅ SSD1306通信テスト成功");
+        
+        // テストパターン表示
+        show_test_pattern(1);
+        
+        return ESP_OK;
+    } else {
+        ESP_LOGE(TAG, "❌ SSD1306通信テスト失敗");
+        return ret;
+    }
+}
+
+// ========================================
+// テストパターン表示
+// ========================================
+esp_err_t SSD1306Display::show_test_pattern(int pattern) 
+{
+    if (!_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    clear();
+    
+    switch (pattern) {
+        case 0: // チェッカーボード
+            for (int y = 0; y < SSD1306_HEIGHT; y++) {
+                for (int x = 0; x < SSD1306_WIDTH; x++) {
+                    bool pixel_on = ((x / 8) + (y / 8)) % 2;
+                    set_pixel(x, y, pixel_on);
                 }
             }
-            give_mutex();
-            ESP_LOGI(TAG, "  サンプル: %d/%d ピクセルが白", white_count, sample_pixels);
+            break;
             
-            // test - 異常パターンの検出
-            if (white_count == sample_pixels) {
-                ESP_LOGW(TAG, "⚠️ サンプルした全てのピクセルが白です");
-            } else if (white_count == 0) {
-                ESP_LOGW(TAG, "⚠️ サンプルした全てのピクセルが黒です");
-            } else {
-                ESP_LOGI(TAG, "✅ 適切な白黒分布です");
+        case 1: // 境界線
+            for (int x = 0; x < SSD1306_WIDTH; x++) {
+                set_pixel(x, 0, true);
+                set_pixel(x, SSD1306_HEIGHT - 1, true);
             }
-        }
-        
-        ret = update(); // ディスプレイに反映
-        
-        if (ret == ESP_OK) {
-            ESP_LOGI(TAG, "✅ プレビュー表示完了");
-        } else {
-            ESP_LOGE(TAG, "❌ ディスプレイ更新失敗: %s", esp_err_to_name(ret));
-        }
-    } else {
-        ESP_LOGE(TAG, "❌ 画像変換失敗: %s", esp_err_to_name(ret));
+            for (int y = 0; y < SSD1306_HEIGHT; y++) {
+                set_pixel(0, y, true);
+                set_pixel(SSD1306_WIDTH - 1, y, true);
+            }
+            draw_string(4, 3, "SSD1306 OK");
+            break;
+            
+        case 2: // グラデーション（縦縞）
+            for (int x = 0; x < SSD1306_WIDTH; x++) {
+                for (int y = 0; y < SSD1306_HEIGHT; y++) {
+                    bool pixel_on = (x % 4) < 2;
+                    set_pixel(x, y, pixel_on);
+                }
+            }
+            break;
+            
+        default: // 全点灯
+            for (int y = 0; y < SSD1306_HEIGHT; y++) {
+                for (int x = 0; x < SSD1306_WIDTH; x++) {
+                    set_pixel(x, y, true);
+                }
+            }
+            break;
     }
     
-    return ret;
+    return display();
 }
 
 // ========================================
-// RGB565画像をモノクロでリサイズにゃ
+// 統計情報表示
 // ========================================
-esp_err_t SSD1306Display::convert_and_resize_rgb565(camera_fb_t* fb) {
-    if (!fb || !fb->buf) return ESP_ERR_INVALID_ARG;
-    
-    const uint16_t* rgb565_data = (const uint16_t*)fb->buf;
-    
-    // test - カメラデータの基本情報をログ出力
-    ESP_LOGI(TAG, "📷 カメラデータ解析開始");
-    ESP_LOGI(TAG, "  画像サイズ: %dx%d", fb->width, fb->height);
-    ESP_LOGI(TAG, "  データ長: %zu bytes", fb->len);
-    ESP_LOGI(TAG, "  フォーマット: %d", fb->format);
-    
-    // test - 最初の数ピクセルのRGB565データをサンプリング
-    ESP_LOGI(TAG, "  RGB565サンプル:");
-    for (int i = 0; i < 8 && i < (fb->width * fb->height); i++) {
-        uint16_t pixel = rgb565_data[i];
-        uint8_t r = (pixel >> 11) & 0x1F;
-        uint8_t g = (pixel >> 5) & 0x3F;
-        uint8_t b = pixel & 0x1F;
-        ESP_LOGI(TAG, "    [%d]: 0x%04X (R:%d G:%d B:%d)", i, pixel, r, g, b);
-    }
-    
-    // スケーリング計算（アスペクト比維持）
-    float scale_x = (float)SSD1306_WIDTH / fb->width;
-    float scale_y = (float)SSD1306_HEIGHT / fb->height;
-    float scale = (scale_x < scale_y) ? scale_x : scale_y; // 小さい方を選択
-    
-    int display_width = (int)(fb->width * scale);
-    int display_height = (int)(fb->height * scale);
-    
-    // 中央配置用のオフセット
-    int offset_x = (SSD1306_WIDTH - display_width) / 2;
-    int offset_y = (SSD1306_HEIGHT - display_height) / 2;
-    
-    ESP_LOGI(TAG, "🔄 画像変換: %dx%d → %dx%d (scale: %.2f)", 
-             fb->width, fb->height, display_width, display_height, scale);
-    ESP_LOGI(TAG, "📐 オフセット: x=%d, y=%d", offset_x, offset_y);
-    
-    // test - 輝度統計用カウンタ
-    int white_pixels = 0;  // 白ピクセル数
-    int black_pixels = 0;  // 黒ピクセル数
-    int total_gray = 0;    // 輝度の総和
-    int pixel_count = 0;   // 処理したピクセル数
-    
-    // リサイズ＆モノクロ変換
-    for (int y = 0; y < display_height; y++) {
-        for (int x = 0; x < display_width; x++) {
-            // 元画像の対応ピクセル位置を計算
-            int src_x = (int)(x / scale);
-            int src_y = (int)(y / scale);
-            
-            // 境界チェック
-            if (src_x >= fb->width || src_y >= fb->height) continue;
-            
-            // RGB565ピクセルを取得
-            uint16_t rgb565 = rgb565_data[src_y * fb->width + src_x];
-            
-            // RGB565をRGBに分解
-            uint8_t r = (rgb565 >> 11) & 0x1F;
-            uint8_t g = (rgb565 >> 5) & 0x3F;
-            uint8_t b = rgb565 & 0x1F;
-            
-            // 8ビットRGBに正規化
-            r = (r * 255) / 31;
-            g = (g * 255) / 63;
-            b = (b * 255) / 31;
-            
-            // 輝度計算（ITU-R BT.601）
-            uint8_t gray = (uint8_t)(0.299f * r + 0.587f * g + 0.114f * b);
-            
-            // test - 統計情報更新
-            total_gray += gray;
-            pixel_count++;
-            
-            // 閾値処理（ディザリングなしの単純な白黒変換）
-            bool pixel_on = gray > 128;
-            
-            // test - 白黒ピクセル数カウント
-            if (pixel_on) {
-                white_pixels++;
-            } else {
-                black_pixels++;
-            }
-            
-            // test - 最初の数ピクセルの変換過程をログ出力
-            if (pixel_count <= 8) {
-                ESP_LOGI(TAG, "    変換[%d,%d]: RGB(%d,%d,%d) → Gray=%d → %s", 
-                         x, y, r, g, b, gray, pixel_on ? "白" : "黒");
-            }
-            
-            // ディスプレイにピクセル描画
-            draw_pixel(offset_x + x, offset_y + y, pixel_on);
-        }
-    }
-    
-    // test - 変換統計情報をログ出力
-    if (pixel_count > 0) {
-        int avg_gray = total_gray / pixel_count;
-        ESP_LOGI(TAG, "📊 変換統計:");
-        ESP_LOGI(TAG, "  処理ピクセル数: %d", pixel_count);
-        ESP_LOGI(TAG, "  平均輝度: %d/255", avg_gray);
-        ESP_LOGI(TAG, "  白ピクセル: %d (%.1f%%)", white_pixels, (float)white_pixels * 100 / pixel_count);
-        ESP_LOGI(TAG, "  黒ピクセル: %d (%.1f%%)", black_pixels, (float)black_pixels * 100 / pixel_count);
-        
-        // test - 異常パターンの検出
-        if (white_pixels == pixel_count) {
-            ESP_LOGW(TAG, "⚠️ 全ピクセルが白です - カメラ露出過多の可能性");
-        } else if (black_pixels == pixel_count) {
-            ESP_LOGW(TAG, "⚠️ 全ピクセルが黒です - カメラ露出不足の可能性");
-        } else if (avg_gray < 64) {
-            ESP_LOGW(TAG, "⚠️ 全体的に暗い画像です (平均輝度: %d)", avg_gray);
-        } else if (avg_gray > 192) {
-            ESP_LOGW(TAG, "⚠️ 全体的に明るい画像です (平均輝度: %d)", avg_gray);
-        } else {
-            ESP_LOGI(TAG, "✅ 適切な輝度分布です");
-        }
-    }
-    
-    return ESP_OK;
+void SSD1306Display::print_stats() 
+{
+    ESP_LOGI(TAG, "\n📊 === SSD1306統計情報 ===");
+    ESP_LOGI(TAG, "🔧 初期化状態: %s", _initialized ? "✅ 初期化済み" : "❌ 未初期化");
+    ESP_LOGI(TAG, "📡 I2Cポート: %d, アドレス: 0x%02X", _i2c_port, _i2c_address);
+    ESP_LOGI(TAG, "📈 画面更新回数: %lu", (unsigned long)_update_count);
+    ESP_LOGI(TAG, "⚠️ I2C通信エラー: %lu", (unsigned long)_i2c_error_count);
+    ESP_LOGI(TAG, "💾 フレームバッファ: %s", _frame_buffer ? "✅ 確保済み" : "❌ 未確保");
 }
 
 // ========================================
-// コントラスト設定にゃ
+// コントラスト設定
 // ========================================
-esp_err_t SSD1306Display::set_contrast(uint8_t contrast) {
-    if (!_initialized) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    
-    esp_err_t ret = send_command(SSD1306_CMD_SET_CONTRAST);
+esp_err_t SSD1306Display::set_contrast(uint8_t contrast) 
+{
+    esp_err_t ret = write_command(SSD1306_CMD_SET_CONTRAST);
     if (ret == ESP_OK) {
-        ret = send_command(contrast);
+        ret = write_command(contrast);
     }
     
+    ESP_LOGD(TAG, "コントラスト設定: %d", contrast);
     return ret;
 }
 
 // ========================================
-// 表示ON/OFF にゃ
+// 表示ON/OFF
 // ========================================
-esp_err_t SSD1306Display::set_display_on(bool on) {
-    if (!_initialized) {
-        return ESP_ERR_INVALID_STATE;
-    }
+esp_err_t SSD1306Display::set_display_on(bool on) 
+{
+    uint8_t cmd = on ? SSD1306_CMD_DISPLAY_ON : SSD1306_CMD_DISPLAY_OFF;
+    esp_err_t ret = write_command(cmd);
     
-    return send_command(on ? SSD1306_CMD_SET_DISP_ON : SSD1306_CMD_SET_DISP_OFF);
-}
-
-// ========================================
-// 反転表示にゃ
-// ========================================
-esp_err_t SSD1306Display::set_invert_display(bool invert) {
-    if (!_initialized) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    
-    return send_command(invert ? SSD1306_CMD_SET_INVERT_DISP : SSD1306_CMD_SET_NORM_DISP);
-}
-
-// ========================================
-// ステータス確認にゃ
-// ========================================
-bool SSD1306Display::is_initialized() const {
-    return _initialized;
-}
-
-// ========================================
-// I2Cアドレス取得にゃ
-// ========================================
-uint8_t SSD1306Display::get_i2c_address() const {
-    return _i2c_address;
-}
-
-// ========================================
-// ミューテックス処理にゃ
-// ========================================
-bool SSD1306Display::take_mutex() {
-    if (!_display_mutex) return false;
-    return xSemaphoreTake(_display_mutex, pdMS_TO_TICKS(100)) == pdTRUE;
-}
-
-void SSD1306Display::give_mutex() {
-    if (_display_mutex) {
-        xSemaphoreGive(_display_mutex);
-    }
+    ESP_LOGD(TAG, "ディスプレイ: %s", on ? "ON" : "OFF");
+    return ret;
 }

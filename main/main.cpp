@@ -425,43 +425,58 @@ static esp_err_t init_gpio()
 }
 
 // ========================================
-// I2C初期化 (ESP-IDF 5.4新しいドライバー)にゃ
+// I2C初期化 (ESP-IDF 5.4新しいドライバー)
 // ========================================
 static esp_err_t init_i2c_master()
 {
-    ESP_LOGI(TAG, "🔧 I2Cマスター初期化開始（レガシードライバー使用）");
+    ESP_LOGI(TAG, "🔧 統一I2Cマスター初期化開始（完全レガシー版）");
 
-    // I2C設定構造体
-    i2c_config_t conf = {};
-    conf.mode = I2C_MODE_MASTER;
-    conf.sda_io_num = I2C_SDA_PIN;
-    conf.sda_pullup_en = GPIO_PULLUP_ENABLE;
-    conf.scl_io_num = I2C_SCL_PIN;
-    conf.scl_pullup_en = GPIO_PULLUP_ENABLE;
-    conf.master.clk_speed = 100000; // 100kHz（安定性重視）
+    // カメラ用I2C (I2C_NUM_0) 初期化
+    i2c_config_t camera_conf = {};
+    camera_conf.mode = I2C_MODE_MASTER;
+    camera_conf.sda_io_num = CAMERA_I2C_SDA;  // GPIO12
+    camera_conf.sda_pullup_en = GPIO_PULLUP_ENABLE;
+    camera_conf.scl_io_num = CAMERA_I2C_SCL;  // GPIO9
+    camera_conf.scl_pullup_en = GPIO_PULLUP_ENABLE;
+    camera_conf.master.clk_speed = 100000;    // 100kHz（安定性重視）
 
-    // I2Cパラメータ設定
-    esp_err_t ret = i2c_param_config(I2C_MASTER_NUM, &conf);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "I2C設定失敗: %s", esp_err_to_name(ret));
-        set_system_status(SYSTEM_STATUS_ERROR);
+    esp_err_t ret = i2c_param_config(CAMERA_I2C_NUM, &camera_conf);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "カメラI2C設定失敗: %s", esp_err_to_name(ret));
         return ret;
     }
 
-    // I2Cドライバーインストール
-    ret = i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "I2Cドライバーインストール失敗: %s", esp_err_to_name(ret));
-        set_system_status(SYSTEM_STATUS_ERROR);
+    ret = i2c_driver_install(CAMERA_I2C_NUM, camera_conf.mode, 0, 0, 0);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "カメラI2Cドライバーインストール失敗: %s", esp_err_to_name(ret));
         return ret;
     }
 
-    ESP_LOGI(TAG, "✅ I2Cマスター初期化完了（レガシー版）");
-    ESP_LOGI(TAG, "   ポート: %d, SDA: GPIO%d, SCL: GPIO%d, 速度: 100kHz",
-             I2C_MASTER_NUM, I2C_SDA_PIN, I2C_SCL_PIN);
+    ESP_LOGI(TAG, "✅ カメラI2C初期化完了 (ポート%d)", CAMERA_I2C_NUM);
 
+    // エンコーダ用I2C (I2C_NUM_1) 初期化
+    i2c_config_t encoder_conf = {};
+    encoder_conf.mode = I2C_MODE_MASTER;
+    encoder_conf.sda_io_num = I2C_SDA_PIN;    // GPIO1
+    encoder_conf.sda_pullup_en = GPIO_PULLUP_ENABLE;
+    encoder_conf.scl_io_num = I2C_SCL_PIN;    // GPIO2
+    encoder_conf.scl_pullup_en = GPIO_PULLUP_ENABLE;
+    encoder_conf.master.clk_speed = 100000;   // 100kHz（安定性重視）
+
+    ret = i2c_param_config(I2C_MASTER_NUM, &encoder_conf);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "エンコーダI2C設定失敗: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = i2c_driver_install(I2C_MASTER_NUM, encoder_conf.mode, 0, 0, 0);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "エンコーダI2Cドライバーインストール失敗: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "✅ エンコーダI2C初期化完了 (ポート%d)", I2C_MASTER_NUM);
+    ESP_LOGI(TAG, "✅ 統一I2Cマスター初期化完了（完全レガシー版）");
     return ESP_OK;
 }
 
@@ -538,16 +553,13 @@ static esp_err_t init_sdcard()
 // ========================================
 static esp_err_t init_camera()
 {
-    ESP_LOGI(TAG, "🔧 カメラ初期化開始にゃ");
+    ESP_LOGI(TAG, "🔧 カメラ初期化開始（レガシーI2C統一版）");
 
     // PSRAM確認（ESP-IDF 5.4対応）
     size_t psram_size = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
-    if (psram_size == 0)
-    {
+    if (psram_size == 0) {
         ESP_LOGW(TAG, "⚠️ PSRAMが検出されません。内蔵RAMを使用します");
-    }
-    else
-    {
+    } else {
         ESP_LOGI(TAG, "✅ PSRAM検出: %zu bytes", psram_size);
     }
 
@@ -556,8 +568,8 @@ static esp_err_t init_camera()
     vTaskDelay(pdMS_TO_TICKS(500));
     ESP_LOGI(TAG, "🔌 カメラ電源ON");
 
-    // カメラ設定構造体（esp-camera 2.1.3対応）
-    camera_config_t camera_config = {}; // 全フィールドを0で初期化
+    // カメラ設定構造体（esp-camera 2.1.3対応、レガシーI2C強制）
+    camera_config_t camera_config = {};
     camera_config.pin_pwdn = GPIO_NUM_NC;
     camera_config.pin_reset = GPIO_NUM_NC;
     camera_config.pin_xclk = CAM_PIN_XCLK;
@@ -583,12 +595,13 @@ static esp_err_t init_camera()
     camera_config.fb_count = 2;
     camera_config.fb_location = (psram_size > 0) ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
     camera_config.grab_mode = CAMERA_GRAB_LATEST;
-    camera_config.sccb_i2c_port = CAMERA_I2C_NUM;
+    
+    // 重要: レガシーI2Cポートを明示的に指定
+    camera_config.sccb_i2c_port = CAMERA_I2C_NUM;  // I2C_NUM_0を強制使用
 
     // カメラドライバ初期化
     esp_err_t err = esp_camera_init(&camera_config);
-    if (err != ESP_OK)
-    {
+    if (err != ESP_OK) {
         ESP_LOGE(TAG, "❌ カメラ初期化失敗: 0x%x (%s)", err, esp_err_to_name(err));
         set_system_status(SYSTEM_STATUS_ERROR);
         return err;
@@ -596,21 +609,17 @@ static esp_err_t init_camera()
 
     // センサー設定（AtomS3R Cam用）
     sensor_t *sensor = esp_camera_sensor_get();
-    if (sensor)
-    {
+    if (sensor) {
         sensor->set_hmirror(sensor, 1); // 左右反転
         sensor->set_vflip(sensor, 1);   // 上下反転
-
-        // 追加設定
-        sensor->set_brightness(sensor, 0); // 明度: -2～2
-        sensor->set_contrast(sensor, 0);   // コントラスト: -2～2
-        sensor->set_saturation(sensor, 0); // 彩度: -2～2
-        sensor->set_sharpness(sensor, 0);  // シャープネス: -2～2
-
+        sensor->set_brightness(sensor, 0);
+        sensor->set_contrast(sensor, 0);
+        sensor->set_saturation(sensor, 0);
+        sensor->set_sharpness(sensor, 0);
         ESP_LOGI(TAG, "📷 センサー設定完了");
     }
 
-    ESP_LOGI(TAG, "✅ カメラ初期化完了にゃ");
+    ESP_LOGI(TAG, "✅ カメラ初期化完了（レガシーI2C統一版）");
     return ESP_OK;
 }
 
@@ -621,22 +630,18 @@ static esp_err_t init_camera()
  */
 static esp_err_t init_display()
 {
-    ESP_LOGI(TAG, "🔧 ディスプレイ初期化開始（暫定的にスキップ）");
+    ESP_LOGI(TAG, "🔧 ディスプレイ初期化開始");
 
-    // TODO: SSD1306Displayクラスが実装されたら有効化
-    /*
-    // レガシードライバーでは I2C ポート番号を使用
+    // レガシードライバー版SSD1306Display使用
     g_display = new SSD1306Display(I2C_MASTER_NUM, SSD1306_DEFAULT_ADDR);
-    if (!g_display)
-    {
+    if (!g_display) {
         ESP_LOGE(TAG, "❌ ディスプレイオブジェクト作成失敗");
         set_system_status(SYSTEM_STATUS_ERROR);
         return ESP_ERR_NO_MEM;
     }
 
     esp_err_t ret = g_display->begin();
-    if (ret != ESP_OK)
-    {
+    if (ret != ESP_OK) {
         ESP_LOGW(TAG, "⚠️ ディスプレイ初期化失敗、ディスプレイなしで続行");
         delete g_display;
         g_display = nullptr;
@@ -645,15 +650,11 @@ static esp_err_t init_display()
 
     // 初期表示
     g_display->clear();
-    g_display->set_text_size(1);
-    g_display->set_cursor(0, 0);
-    g_display->print("Pixel Art Camera");
-    g_display->set_cursor(0, 16);
-    g_display->print("Initializing...");
+    g_display->print_line(0, "Pixel Art Cam");
+    g_display->print_line(1, "Initializing...");
     g_display->display();
-    */
 
-    ESP_LOGI(TAG, "✅ ディスプレイ初期化完了（スキップ）");
+    ESP_LOGI(TAG, "✅ ディスプレイ初期化完了");
     return ESP_OK;
 }
 
@@ -911,75 +912,76 @@ static bool request_capture(bool save_all_palettes)
 // ========================================
 // カメラプレビュー表示
 // ========================================
-static void show_camera_preview(camera_fb_t *fb)
+static void show_camera_preview(camera_fb_t* fb)
 {
-    if (!g_display_enabled || !g_display || !fb)
-    {
-        return; // ディスプレイが無効、または無効なフレームバッファ
+    if (!g_display || !g_display->is_initialized() || !fb) {
+        return;
     }
-
-    // プレビュー表示（エラーでも続行）
-    esp_err_t ret = g_display->show_camera_preview(fb);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGD(TAG, "プレビュー表示スキップ: %s", esp_err_to_name(ret));
+    
+    // プレビュー表示（画面全体を使用）
+    esp_err_t ret = g_display->show_camera_preview(fb, 0, 0, 128, 64);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "⚠️ カメラプレビュー表示失敗: %s", esp_err_to_name(ret));
     }
 }
 
 // ========================================
-// ディスプレイステータス表示にゃ
+// ディスプレイステータス表示
 // ========================================
-static void update_display_status(const char *status, int palette_index)
+static void update_display_status(const char* status, int palette_index)
 {
-    if (!g_display_enabled || !g_display)
-    {
+    if (!g_display || !g_display->is_initialized()) {
         return;
     }
-
+    
+    // ディスプレイクリア
     g_display->clear();
-    g_display->draw_text(0, 0, "PixelArt Camera", 1);
-
-    if (status)
-    {
-        g_display->draw_text(0, 16, status, 1);
+    
+    // タイトル表示（行0）
+    g_display->print_line(0, "PixelArt Cam");
+    
+    // ステータス表示（行2）
+    if (status) {
+        g_display->print_line(2, status);
     }
-
-    if (palette_index >= 0)
-    {
-        char palette_str[32];
+    
+    // パレット情報表示（行4）
+    if (palette_index >= 0) {
+        char palette_str[20];
         snprintf(palette_str, sizeof(palette_str), "Palette: %d", palette_index);
-        g_display->draw_text(0, 32, palette_str, 1);
+        g_display->print_line(4, palette_str);
     }
-
-    // システムステータスを表示
-    const char *sys_status = "";
-    switch (g_system_status)
-    {
-    case SYSTEM_STATUS_INITIALIZING:
-        sys_status = "Initializing...";
-        break;
-    case SYSTEM_STATUS_READY:
-        sys_status = "Ready!";
-        break;
-    case SYSTEM_STATUS_CAPTURING:
-        sys_status = "Capturing...";
-        break;
-    case SYSTEM_STATUS_PROCESSING:
-        sys_status = "Processing...";
-        break;
-    case SYSTEM_STATUS_SAVING:
-        sys_status = "Saving...";
-        break;
-    case SYSTEM_STATUS_ERROR:
-        sys_status = "Error!";
-        break;
-    default:
-        sys_status = "Unknown";
-        break;
+    
+    // システム状態表示（行6）
+    const char* sys_status = "";
+    switch (g_system_status) {
+        case SYSTEM_STATUS_INITIALIZING:
+            sys_status = "Initializing...";
+            break;
+        case SYSTEM_STATUS_READY:
+            sys_status = "Ready";
+            break;
+        case SYSTEM_STATUS_CAPTURING:
+            sys_status = "Capturing...";
+            break;
+        case SYSTEM_STATUS_PROCESSING:
+            sys_status = "Processing...";
+            break;
+        case SYSTEM_STATUS_SAVING:
+            sys_status = "Saving...";
+            break;
+        case SYSTEM_STATUS_ERROR:
+            sys_status = "Error!";
+            break;
+        default:
+            sys_status = "Unknown";
+            break;
     }
-    g_display->draw_text(0, 48, sys_status, 1);
-
-    g_display->update();
+    
+    g_display->print_line(6, sys_status);
+    
+    // ディスプレイ更新
+    g_display->display();
 }
 
 // ========================================
@@ -1267,20 +1269,21 @@ static void stats_task(void *pvParameters)
 // ========================================
 static void display_preview_task(void *pvParameters)
 {
-    ESP_LOGI(TAG, "🖥️ ディスプレイプレビュータスク開始 (Core %d)", xPortGetCoreID());
-
-    while (1)
-    {
-        // システムが準備完了でディスプレイが有効な場合のみプレビュー更新
-        if (g_display_enabled && g_system_status == SYSTEM_STATUS_READY)
-        {
+    ESP_LOGI(TAG, "🖼️ プレビュータスク開始");
+    
+    while (true) {
+        // システム状態確認
+        if (g_system_status == SYSTEM_STATUS_READY) {
             // カメラフレームを取得してプレビュー表示
             camera_fb_t *fb = esp_camera_fb_get();
-            if (fb)
-            {
+            if (fb) {
                 show_camera_preview(fb);
                 esp_camera_fb_return(fb);
             }
+        } else {
+            // システム状態をディスプレイに表示
+            int current_palette = (g_encoder) ? g_encoder->get_value() : 0;
+            update_display_status(nullptr, current_palette);
         }
 
         vTaskDelay(pdMS_TO_TICKS(100)); // 10FPS更新
@@ -1292,59 +1295,53 @@ static void display_preview_task(void *pvParameters)
 // ========================================
 static esp_err_t init_all_systems()
 {
-    ESP_LOGI(TAG, "\n🚀 === システム初期化開始 ===");
+    ESP_LOGI(TAG, "\n🚀 === システム初期化開始（レガシーI2C統一版） ===");
     set_system_status(SYSTEM_STATUS_INITIALIZING);
 
     esp_err_t ret;
 
     // 基本システム初期化
     ret = init_gpio();
-    if (ret != ESP_OK)
-    {
+    if (ret != ESP_OK) {
         ESP_LOGE(TAG, "GPIO初期化失敗: %s", esp_err_to_name(ret));
         return ret;
     }
 
     ret = init_sync_objects();
-    if (ret != ESP_OK)
-    {
+    if (ret != ESP_OK) {
         ESP_LOGE(TAG, "同期オブジェクト初期化失敗: %s", esp_err_to_name(ret));
         return ret;
     }
 
+    // 統一I2C初期化（レガシー版）
     ret = init_i2c_master();
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "I2C初期化失敗: %s", esp_err_to_name(ret));
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "統一I2C初期化失敗: %s", esp_err_to_name(ret));
         return ret;
     }
 
-    // ハードウェア初期化
+    // カメラ初期化（レガシーI2C版）
     ret = init_camera();
-    if (ret != ESP_OK)
-    {
+    if (ret != ESP_OK) {
         ESP_LOGE(TAG, "カメラ初期化失敗: %s", esp_err_to_name(ret));
         return ret;
     }
 
+    // 以下、他の初期化処理は同じ...
     ret = init_sdcard();
-    if (ret != ESP_OK)
-    {
+    if (ret != ESP_OK) {
         ESP_LOGE(TAG, "SDカード初期化失敗: %s", esp_err_to_name(ret));
         return ret;
     }
 
-    // アプリケーション初期化
     ret = init_processor();
-    if (ret != ESP_OK)
-    {
+    if (ret != ESP_OK) {
         ESP_LOGE(TAG, "画像処理初期化失敗: %s", esp_err_to_name(ret));
         return ret;
     }
 
     ret = init_camera_utils();
-    if (ret != ESP_OK)
-    {
+    if (ret != ESP_OK) {
         ESP_LOGE(TAG, "カメラユーティリティ初期化失敗: %s", esp_err_to_name(ret));
         return ret;
     }
@@ -1355,7 +1352,7 @@ static esp_err_t init_all_systems()
     // LCD初期化
     init_display(); // 失敗してもシステム続行
 
-    ESP_LOGI(TAG, "✅ === システム初期化完了 ===\n");
+    ESP_LOGI(TAG, "✅ === システム初期化完了（レガシーI2C統一版） ===\n");
     return ESP_OK;
 }
 
