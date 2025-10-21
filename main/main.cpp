@@ -129,13 +129,13 @@ static QueueHandle_t g_capture_queue = NULL;
 
 // ハードウェア
 // static i2c_master_bus_handle_t g_i2c_bus_handle = NULL; // 新しいI2Cバスハンドル
-static PimoroniEncoder *g_encoder = nullptr;
-static PixelArtProcessor *g_processor = nullptr;
-static CameraUtils *g_camera_utils = nullptr;
+//static PimoroniEncoder *g_encoder = nullptr;
+//static PixelArtProcessor *g_processor = nullptr;
+//static CameraUtils *g_camera_utils = nullptr;
 static bool g_camera_ready = false;
 
 // SSD1306ディスプレイオブジェクト
-static SSD1306Display *g_display = nullptr;
+//static SSD1306Display *g_display = nullptr;
 static bool g_display_enabled = false;
 
 // 状態管理
@@ -203,3 +203,18 @@ static const uint32_t PALETTE_REP_COLORS[8] = {
     0xFFD159, // パレット7: 黄色系
 };
 
+
+// ========================================
+// アプリケーションメインにゃ
+// ========================================
+extern "C" void app_main()
+{
+    ESP_LOGI(TAG, "\n\n");
+    ESP_LOGI(TAG, "╔══════════════════════════════════════════════╗");
+    ESP_LOGI(TAG, "║  📸 ピクセルアートカメラ ESP-IDF 5.4版 📸  ║");
+    ESP_LOGI(TAG, "║       🎨 8色パレット + ステータスLED 🎨      ║");
+    ESP_LOGI(TAG, "╚══════════════════════════════════════════════╝");
+    ESP_LOGI(TAG, "🔧 ESP-IDF Version: %s", esp_get_idf_version());
+
+
+}
