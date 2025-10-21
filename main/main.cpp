@@ -74,10 +74,15 @@ static const char *TAG = "PixelArtCamera";
 #define I2C_SCL_PIN GPIO_NUM_2   // 外部I2C SCL
 #define I2C_FREQ_HZ 400000       // 400kHz
 
+// 外部装置I2C設定
+#define EXTERNAL_I2C_NUM I2C_NUM_1 // 外部装置専用I2C
+#define EXTERNAL_I2C_FREQ_HZ 400000 // 外部装置は400kHzで高速動作
+
 // カメラI2C設定（ESP32-S3内蔵I2C使用）
 #define CAMERA_I2C_NUM I2C_NUM_0   // カメラ専用I2C
 #define CAMERA_I2C_SDA GPIO_NUM_12 // カメラI2C SDA
 #define CAMERA_I2C_SCL GPIO_NUM_9  // カメラI2C SCL
+#define CAMERA_I2C_FREQ_HZ 100000  // カメラは100kHzで安定動作
 
 // カメラピン設定
 #define CAM_PIN_XCLK GPIO_NUM_21
@@ -205,7 +210,107 @@ static const uint32_t PALETTE_REP_COLORS[8] = {
 
 
 // ========================================
-// アプリケーションメインにゃ
+// I2C初期化関数群
+// ========================================
+
+/**
+ * カメラ用I2C (I2C_NUM_0) を初期化する関数
+ * @return ESP_OK: 成功, その他: エラーコード
+ */
+esp_err_t init_camera_i2c(void)
+{
+    // カメラI2C設定構造体を初期化
+    i2c_config_t camera_i2c_config = {};
+    camera_i2c_config.mode = I2C_MODE_MASTER;
+    camera_i2c_config.sda_io_num = CAMERA_I2C_SDA;
+    camera_i2c_config.scl_io_num = CAMERA_I2C_SCL;
+    camera_i2c_config.sda_pullup_en = GPIO_PULLUP_ENABLE;
+    camera_i2c_config.scl_pullup_en = GPIO_PULLUP_ENABLE;
+    camera_i2c_config.master.clk_speed = CAMERA_I2C_FREQ_HZ;
+    camera_i2c_config.clk_flags = 0; // ESP-IDF 5.4では明示的に0を設定
+    
+    // I2Cパラメータを設定
+    esp_err_t ret = i2c_param_config(CAMERA_I2C_NUM, &camera_i2c_config);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    
+    // I2Cドライバーをインストール
+    // (ポート番号, モード, スレーブ受信バッファサイズ, スレーブ送信バッファサイズ, 割り込みフラグ)
+    ret = i2c_driver_install(CAMERA_I2C_NUM, camera_i2c_config.mode, 0, 0, 0);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    
+    return ESP_OK;
+}
+
+/**
+ * 外部装置用I2C (I2C_NUM_1) を初期化する関数
+ * @return ESP_OK: 成功, その他: エラーコード
+ */
+esp_err_t init_external_i2c(void)
+{
+    // 外部装置I2C設定構造体を初期化
+    i2c_config_t external_i2c_config = {};
+    external_i2c_config.mode = I2C_MODE_MASTER;
+    external_i2c_config.sda_io_num = I2C_SDA_PIN;
+    external_i2c_config.scl_io_num = I2C_SCL_PIN;
+    external_i2c_config.sda_pullup_en = GPIO_PULLUP_ENABLE;
+    external_i2c_config.scl_pullup_en = GPIO_PULLUP_ENABLE;
+    external_i2c_config.master.clk_speed = EXTERNAL_I2C_FREQ_HZ;
+    external_i2c_config.clk_flags = 0; // ESP-IDF 5.4では明示的に0を設定
+    
+    // I2Cパラメータを設定
+    esp_err_t ret = i2c_param_config(EXTERNAL_I2C_NUM, &external_i2c_config);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    
+    // I2Cドライバーをインストール
+    // (ポート番号, モード, スレーブ受信バッファサイズ, スレーブ送信バッファサイズ, 割り込みフラグ)
+    ret = i2c_driver_install(EXTERNAL_I2C_NUM, external_i2c_config.mode, 0, 0, 0);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    
+    return ESP_OK;
+}
+
+/**
+ * I2Cデバイススキャン関数（デバッグ用）
+ * @param i2c_num I2Cポート番号
+ * @param found_devices 見つかったデバイス数を格納するポインタ
+ * @return ESP_OK: 成功, その他: エラーコード
+ */
+esp_err_t scan_i2c_devices(i2c_port_t i2c_num, int *found_devices)
+{
+    int device_count = 0;
+    esp_err_t ret;
+    
+    for (uint8_t addr = 0x08; addr < 0x78; addr++) {
+        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+        i2c_master_start(cmd);
+        i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_WRITE, true);
+        i2c_master_stop(cmd);
+        
+        ret = i2c_master_cmd_begin(i2c_num, cmd, pdMS_TO_TICKS(100));
+        i2c_cmd_link_delete(cmd);
+        
+        if (ret == ESP_OK) {
+            device_count++;
+        }
+    }
+    
+    if (found_devices != NULL) {
+        *found_devices = device_count;
+    }
+    
+    return ESP_OK;
+}
+
+// ========================================
+// アプリケーションメイン
 // ========================================
 extern "C" void app_main()
 {
@@ -215,6 +320,81 @@ extern "C" void app_main()
     ESP_LOGI(TAG, "║       🎨 8色パレット + ステータスLED 🎨      ║");
     ESP_LOGI(TAG, "╚══════════════════════════════════════════════╝");
     ESP_LOGI(TAG, "🔧 ESP-IDF Version: %s", esp_get_idf_version());
-
-
+    
+    // チップ情報を表示
+    esp_chip_info_t chip_info;
+    esp_chip_info(&chip_info);
+    ESP_LOGI(TAG, "💾 ESP32 チップ: %s rev %d, CPU コア数: %d",
+             CONFIG_IDF_TARGET, chip_info.revision, chip_info.cores);
+    
+    // PSRAMチェック
+    size_t psram_size = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+    if (psram_size > 0) {
+        ESP_LOGI(TAG, "✅ PSRAM検出: %lu KB", (unsigned long)(psram_size / 1024));
+    } else {
+        ESP_LOGW(TAG, "⚠️  PSRAM未検出: 内蔵RAMのみで動作");
+    }
+    
+    ESP_LOGI(TAG, "\n🔧 === I2Cバス初期化開始 ===");
+    
+    // ========================================
+    // カメラ用I2C初期化
+    // ========================================
+    ESP_LOGI(TAG, "📹 カメラ用I2C (I2C_NUM_0) 初期化中...");
+    ESP_LOGI(TAG, "   SDA: GPIO%d, SCL: GPIO%d, 周波数: %d Hz", 
+             CAMERA_I2C_SDA, CAMERA_I2C_SCL, CAMERA_I2C_FREQ_HZ);
+    
+    esp_err_t camera_i2c_result = init_camera_i2c();
+    if (camera_i2c_result == ESP_OK) {
+        ESP_LOGI(TAG, "✅ カメラ用I2C初期化成功");
+        
+        // カメラI2Cバスでデバイススキャン
+        int camera_devices = 0;
+        scan_i2c_devices(CAMERA_I2C_NUM, &camera_devices);
+        ESP_LOGI(TAG, "   検出デバイス数: %d", camera_devices);
+    } else {
+        ESP_LOGE(TAG, "❌ カメラ用I2C初期化失敗: %s", esp_err_to_name(camera_i2c_result));
+    }
+    
+    // ========================================
+    // 外部装置用I2C初期化
+    // ========================================
+    ESP_LOGI(TAG, "🔧 外部装置用I2C (I2C_NUM_1) 初期化中...");
+    ESP_LOGI(TAG, "   SDA: GPIO%d, SCL: GPIO%d, 周波数: %d Hz", 
+             I2C_SDA_PIN, I2C_SCL_PIN, EXTERNAL_I2C_FREQ_HZ);
+    
+    esp_err_t external_i2c_result = init_external_i2c();
+    if (external_i2c_result == ESP_OK) {
+        ESP_LOGI(TAG, "✅ 外部装置用I2C初期化成功");
+        
+        // 外部I2Cバスでデバイススキャン
+        int external_devices = 0;
+        scan_i2c_devices(EXTERNAL_I2C_NUM, &external_devices);
+        ESP_LOGI(TAG, "   検出デバイス数: %d", external_devices);
+    } else {
+        ESP_LOGE(TAG, "❌ 外部装置用I2C初期化失敗: %s", esp_err_to_name(external_i2c_result));
+    }
+    
+    // ========================================
+    // 初期化結果サマリー
+    // ========================================
+    ESP_LOGI(TAG, "\n📋 === 初期化結果サマリー ===");
+    ESP_LOGI(TAG, "カメラI2C (I2C_NUM_0):     %s", 
+             camera_i2c_result == ESP_OK ? "✅ 成功" : "❌ 失敗");
+    ESP_LOGI(TAG, "外部装置I2C (I2C_NUM_1):   %s", 
+             external_i2c_result == ESP_OK ? "✅ 成功" : "❌ 失敗");
+    
+    // 両方成功した場合のみシステム準備完了
+    if (camera_i2c_result == ESP_OK && external_i2c_result == ESP_OK) {
+        ESP_LOGI(TAG, "🎉 全てのI2Cバス初期化完了！次のステップに進む準備OK");
+    } else {
+        ESP_LOGE(TAG, "💥 I2C初期化に失敗があります。ハードウェア接続を確認してください");
+    }
+    
+    ESP_LOGI(TAG, "\n⏸️  システム初期化完了。次の実装を待機中...");
+    
+    // メインループ（現在は何もしない）
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
 }
