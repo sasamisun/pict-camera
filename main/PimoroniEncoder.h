@@ -17,14 +17,41 @@
 #define PIMORONI_ENCODER_DEFAULT_ADDR   0x0F    // デフォルトI2Cアドレス
 #define PIMORONI_ENCODER_TIMEOUT_MS     1000    // 通信タイムアウト
 
-// レジスタアドレス定義
-#define REG_INT                         0x00    // 割り込みレジスタ
-#define REG_ENC_1_COUNT                 0x11    // エンコーダカウント値
-#define REG_PWM_PERIOD_L                0x12    // PWM周期（下位）
-#define REG_PWM_PERIOD_H                0x13    // PWM周期（上位）  
-#define REG_PWM_CONTROL                 0x14    // PWM制御
-#define REG_MODE_BASE                   0x04    // モード設定ベースアドレス
-#define REG_PWM_VALUE_BASE              0x18    // PWM値ベースアドレス
+// レジスタアドレス定義 (Pimoroni公式ライブラリより)
+#define REG_INT                         0xF9    // 割り込みレジスタ
+#define REG_ENC_1_COUNT                 0x06    // エンコーダ1カウント値
+#define REG_ENC_EN                      0x04    // エンコーダ有効化
+#define REG_PWMPL                       0x99    // PWM周期（下位）
+#define REG_PWMPH                       0x91    // PWM周期（上位）
+#define REG_PWMCON0                     0x98    // PWM制御0
+#define REG_PWMCON1                     0x9F    // PWM制御1
+
+// GPIO モードレジスタ (ポート0用 - ピン1, 2, 7はポート0に属する)
+#define REG_P0M1                        0x71    // ポート0モード1
+#define REG_P0M2                        0x72    // ポート0モード2
+#define REG_P1M1                        0x73    // ポート1モード1
+#define REG_P1M2                        0x74    // ポート1モード2
+
+// PIOCON レジスタ (PWM有効化用)
+#define REG_PIOCON0                     0x9E    // PIOCON0 (PWM0-3制御)
+#define REG_PIOCON1                     0xC9    // PIOCON1 (PWM4-5制御)
+
+// PWM値レジスタ (個別定義が必要)
+#define REG_PWM0L                       0x9A    // PWM0 下位
+#define REG_PWM0H                       0x92    // PWM0 上位
+#define REG_PWM1L                       0x9B    // PWM1 下位
+#define REG_PWM1H                       0x93    // PWM1 上位
+#define REG_PWM2L                       0x9C    // PWM2 下位
+#define REG_PWM2H                       0x94    // PWM2 上位
+#define REG_PWM3L                       0x9D    // PWM3 下位
+#define REG_PWM3H                       0x95    // PWM3 上位
+#define REG_PWM4L                       0xCA    // PWM4 下位
+#define REG_PWM4H                       0xC7    // PWM4 上位
+#define REG_PWM5L                       0xCB    // PWM5 下位
+#define REG_PWM5H                       0xC8    // PWM5 上位
+
+// PNPレジスタ (PWM極性反転制御)
+#define REG_PNP                         0x96    // PWM極性反転レジスタ
 
 // RGBピン定義（MS51 内部ピン番号）
 #define PIN_RED                         1       // 赤LED
@@ -139,6 +166,18 @@ public:
      * @return デバイスI2Cアドレス
      */
     uint8_t get_device_address() const;
+
+    /**
+     * @brief LED色テストを実行（全8色を順番に点灯）
+     * @return ESP_OK: 成功, その他: エラーコード
+     */
+    esp_err_t test_led_colors();
+
+    /**
+     * @brief エンコーダー接続確認
+     * @return true: 接続OK, false: 接続NG
+     */
+    bool check_encoder_connection();
 };
 
 #endif // PIMORONI_ENCODER_H

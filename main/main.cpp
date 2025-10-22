@@ -2,9 +2,8 @@
  * AtomS3R ピクセルアートカメラ (ESP-IDF 5.4完全対応版)
  *
  * ToDo:
- * i2cを初期化して、デバイスを使える状態にする→完了
- * G38 G39プルアップボタン入力（シャッターボタン・メニューボタン）→実装中
- * encoder 入力、LEDテスト
+ * G38 G39プルアップボタン入力（シャッターボタン・メニューボタン）→完了
+ * encoder 入力、LEDテスト→実装中
  * LCD表示テスト フォント準備 M5GFX
  * カメラからLCD表示
  * カメラ画像をカラーパレットをもとに変換（短押し１パレット、長押し全パレット）
@@ -59,12 +58,10 @@
 #endif
 
 // カスタムクラス
-
 #include "PimoroniEncoder.h"
 //#include "PixelArtProcessor.h"
 #include "camera_utils.h"
 #include "ssd1306_display.h"
-
 
 // ========================================
 // 定数定義
@@ -77,9 +74,9 @@ static const char *TAG = "PixelArtCamera";
 #define SPI_MOSI_PIN GPIO_NUM_6
 #define SPI_CS_PIN GPIO_NUM_15
 
-// ボタンピン設定
-#define SHUTTER_BUTTON_PIN GPIO_NUM_38   // シャッターボタン（撮影用）
-#define MENU_BUTTON_PIN GPIO_NUM_39      // メニューボタン（設定用）
+#define SHUTTER_BUTTON_PIN GPIO_NUM_38   // 撮影ボタン（プルアップ、押下でLOW）
+#define MENU_BUTTON_PIN GPIO_NUM_39      // メニューボタン（プルアップ、押下でLOW）
+#define LED_PIN GPIO_NUM_39              // 状態LED
 
 // I2C設定
 #define I2C_SDA_PIN GPIO_NUM_1 // 外部I2C SDA
@@ -91,8 +88,9 @@ static const char *TAG = "PixelArtCamera";
 #define EXTERNAL_I2C_FREQ_HZ 400000 // 外部装置は400kHzで高速動作
 
 // ボタン設定
-#define BUTTON_DEBOUNCE_MS 50        // チャタリング防止時間（ミリ秒）
-#define BUTTON_LONG_PRESS_MS 1000    // 長押し判定時間（ミリ秒）
+#define BUTTON_LONG_PRESS_MS 1000    // 長押し判定時間
+#define BUTTON_DEBOUNCE_MS 50        // チャタリング防止時間
+#define BUTTON_REPEAT_DELAY_MS 500   // 連続押し間隔
 
 // その他設定
 #define DEBOUNCE_DELAY_MS 300    // ボタンチャタリング防止
@@ -101,20 +99,40 @@ static const char *TAG = "PixelArtCamera";
 #define IMAGE_HEIGHT 176         // 画像高
 #define CAPTURE_TASK_STACK 8192  // タスクスタックサイズ
 #define PROCESS_TASK_STACK 16384 // 画像処理用大きめスタック
+#define ENCODER_TASK_STACK 4096  // エンコーダータスクスタック
 
 // ========================================
-// ボタン状態管理用構造体
+// ボタン状態管理構造体
 // ========================================
 typedef struct {
-    gpio_num_t pin;              // ピン番号
-    bool current_state;          // 現在の状態（true=押下中）
-    bool last_state;             // 前回の状態
-    uint32_t last_change_time;   // 最後に状態が変わった時間
-    uint32_t press_start_time;   // 押下開始時間
-    bool debounced_state;        // チャタリング除去後の状態
-    bool short_press_detected;   // 短押し検出フラグ
-    bool long_press_detected;    // 長押し検出フラグ
+    gpio_num_t pin;                    // GPIOピン番号
+    bool current_state;                // 現在の状態（true=押下、false=離す）
+    bool last_state;                   // 前回の状態
+    uint32_t press_start_time;         // 押下開始時刻
+    uint32_t last_change_time;         // 最後の状態変化時刻
+    bool long_press_triggered;         // 長押しイベント発生済みフラグ
+    const char* name;                  // ボタン名（デバッグ用）
 } button_state_t;
+
+// ========================================
+// ボタンイベント定義
+// ========================================
+typedef enum {
+    BUTTON_EVENT_NONE = 0,
+    BUTTON_EVENT_SHORT_PRESS,    // 短押し
+    BUTTON_EVENT_LONG_PRESS,     // 長押し
+    BUTTON_EVENT_PRESS_START,    // 押下開始
+    BUTTON_EVENT_PRESS_END       // 押下終了
+} button_event_t;
+
+// ========================================
+// エンコーダーイベント定義
+// ========================================
+typedef struct {
+    int16_t value;              // エンコーダー値
+    int16_t delta;              // 前回からの変化量
+    uint32_t timestamp;         // イベント発生時刻
+} encoder_event_t;
 
 // ========================================
 // ステータスLED制御定義
@@ -129,10 +147,6 @@ typedef enum
     SYSTEM_STATUS_ERROR         // エラー（赤高速点滅）
 } system_status_t;
 
-// 点滅設定
-#define BLINK_NORMAL_INTERVAL_MS 500 // 通常点滅間隔
-#define BLINK_FAST_INTERVAL_MS 200   // 高速点滅間隔
-
 // ========================================
 // グローバル変数
 // ========================================
@@ -141,15 +155,33 @@ typedef enum
 static SemaphoreHandle_t g_capture_semaphore = NULL;
 static SemaphoreHandle_t g_i2c_mutex = NULL;
 static QueueHandle_t g_capture_queue = NULL;
+static QueueHandle_t g_encoder_event_queue = NULL;
+
+// ボタン状態
+static button_state_t g_shutter_button = {
+    .pin = SHUTTER_BUTTON_PIN,
+    .current_state = false,
+    .last_state = false,
+    .press_start_time = 0,
+    .last_change_time = 0,
+    .long_press_triggered = false,
+    .name = "Shutter"
+};
+
+static button_state_t g_menu_button = {
+    .pin = MENU_BUTTON_PIN,
+    .current_state = false,
+    .last_state = false,
+    .press_start_time = 0,
+    .last_change_time = 0,
+    .long_press_triggered = false,
+    .name = "Menu"
+};
 
 // 状態管理
 static volatile int g_current_palette_index = 0;
 static volatile int g_file_counter = 1;
 static volatile uint32_t g_last_button_press = 0;
-
-// ボタン状態管理
-static button_state_t g_shutter_button = {SHUTTER_BUTTON_PIN, false, false, 0, 0, false, false, false};
-static button_state_t g_menu_button = {MENU_BUTTON_PIN, false, false, 0, 0, false, false, false};
 
 // ハードウェアオブジェクト
 static PimoroniEncoder* g_encoder = nullptr;
@@ -171,14 +203,6 @@ static volatile bool g_status_led_enabled = true;
 static sdmmc_card_t *g_sd_card = NULL;
 static const char *g_mount_point = "/sdcard";
 static bool g_sd_card_mounted = false;
-
-// 撮影データ構造体
-typedef struct
-{
-    uint32_t timestamp;
-    int palette_index;
-    bool save_all_palettes; // 全パレット保存フラグ
-} capture_request_t;
 
 // ========================================
 // カラーパレット定義（8種類×8色）
@@ -227,233 +251,270 @@ static const uint32_t PALETTE_REP_COLORS[8] = {
 // ========================================
 
 /**
- * @brief ボタンピンを初期化する関数
- * @return ESP_OK: 成功, その他: エラーコード
+ * ボタンの状態を更新する関数
  */
-esp_err_t init_buttons(void) {
-    ESP_LOGI(TAG, "🔘 ボタン初期化開始");
+void update_button_state(button_state_t* button)
+{
+    // GPIO状態を読み取り（プルアップなので反転）
+    bool pressed = !gpio_get_level(button->pin);
+    uint32_t now = esp_timer_get_time() / 1000; // ミリ秒に変換
     
-    // GPIO設定構造体を初期化
-    gpio_config_t button_config = {};
-    
-    // ボタンピンの設定
-    button_config.pin_bit_mask = ((1ULL << SHUTTER_BUTTON_PIN) | (1ULL << MENU_BUTTON_PIN));
-    button_config.mode = GPIO_MODE_INPUT;           // 入力モード
-    button_config.pull_up_en = GPIO_PULLUP_ENABLE;  // プルアップ有効
-    button_config.pull_down_en = GPIO_PULLDOWN_DISABLE; // プルダウン無効
-    button_config.intr_type = GPIO_INTR_DISABLE;    // 割り込み無効（ポーリングモード）
-    
-    esp_err_t ret = gpio_config(&button_config);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "❌ ボタンGPIO設定失敗: %s", esp_err_to_name(ret));
-        return ret;
+    // チャタリング防止
+    if (now - button->last_change_time < BUTTON_DEBOUNCE_MS) {
+        return;
     }
     
-    ESP_LOGI(TAG, "✅ ボタンGPIO設定完了");
-    ESP_LOGI(TAG, "   シャッターボタン: GPIO%d (プルアップ)", SHUTTER_BUTTON_PIN);
-    ESP_LOGI(TAG, "   メニューボタン: GPIO%d (プルアップ)", MENU_BUTTON_PIN);
-    
-    return ESP_OK;
-}
-
-/**
- * @brief ボタンの状態を更新する関数
- * @param button ボタン状態構造体のポインタ
- */
-void update_button_state(button_state_t* button) {
-    if (button == NULL) return;
-    
-    uint32_t current_time = esp_timer_get_time() / 1000; // マイクロ秒をミリ秒に変換
-    
-    // 現在のピン状態を読み取り（プルアップなので、LOW=押下中）
-    button->current_state = !gpio_get_level(button->pin);
-    
-    // 状態変化の検出
-    if (button->current_state != button->last_state) {
-        button->last_change_time = current_time;
+    // 状態変化検出
+    if (pressed != button->current_state) {
         button->last_state = button->current_state;
-    }
-    
-    // チャタリング除去（一定時間経過後に状態を確定）
-    if ((current_time - button->last_change_time) >= BUTTON_DEBOUNCE_MS) {
-        bool new_debounced_state = button->current_state;
+        button->current_state = pressed;
+        button->last_change_time = now;
         
-        // 押下開始の検出
-        if (new_debounced_state && !button->debounced_state) {
-            button->press_start_time = current_time;
-            button->short_press_detected = false;
-            button->long_press_detected = false;
+        if (pressed) {
+            // 押下開始
+            button->press_start_time = now;
+            button->long_press_triggered = false;
+            ESP_LOGI(TAG, "🔘 %sボタン押下開始", button->name);
+        } else {
+            // 押下終了
+            uint32_t press_duration = now - button->press_start_time;
+            ESP_LOGI(TAG, "🔘 %sボタン押下終了 (持続時間: %lu ms)", button->name, (unsigned long)press_duration);
         }
-        
-        // 押下中の長押し判定
-        if (new_debounced_state && button->debounced_state) {
-            if (!button->long_press_detected && 
-                (current_time - button->press_start_time) >= BUTTON_LONG_PRESS_MS) {
-                button->long_press_detected = true;
-                ESP_LOGI(TAG, "🔘 ボタン長押し検出: GPIO%d", button->pin);
-            }
-        }
-        
-        // 押下終了の検出（短押し判定）
-        if (!new_debounced_state && button->debounced_state) {
-            uint32_t press_duration = current_time - button->press_start_time;
-            if (press_duration < BUTTON_LONG_PRESS_MS && !button->long_press_detected) {
-                button->short_press_detected = true;
-                ESP_LOGI(TAG, "🔘 ボタン短押し検出: GPIO%d (押下時間: %lu ms)", 
-                        button->pin, (unsigned long)press_duration);
-            }
-        }
-        
-        button->debounced_state = new_debounced_state;
     }
 }
 
 /**
- * @brief シャッターボタンの短押し処理
+ * ボタンイベントを処理する関数
  */
-void handle_shutter_short_press(void) {
-    ESP_LOGI(TAG, "📸 シャッターボタン短押し: 単一パレット撮影モード");
+void process_button_events()
+{
+    uint32_t now = esp_timer_get_time() / 1000;
     
-    // エンコーダLEDを撮影中色（オレンジ）に変更
-    if (g_encoder_ready) {
-        g_encoder->set_color(0xFF8000); // オレンジ色
-    }
-    
-    // ディスプレイに撮影メッセージを表示
-    if (g_display_ready) {
-        g_display->clear();
-        g_display->draw_string(0, 0, "Capture Mode", true);
-        g_display->draw_string(0, 16, "Single Palette", true);
-        char palette_str[32];
-        snprintf(palette_str, sizeof(palette_str), "Palette: %d", g_current_palette_index);
-        g_display->draw_string(0, 32, palette_str, true);
-        g_display->display();
-    }
-    
-    // 2秒後に待機状態に戻る
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    
-    if (g_encoder_ready) {
-        g_encoder->set_color(PALETTE_REP_COLORS[g_current_palette_index]);
-    }
-}
-
-/**
- * @brief シャッターボタンの長押し処理
- */
-void handle_shutter_long_press(void) {
-    ESP_LOGI(TAG, "📸 シャッターボタン長押し: 全パレット撮影モード");
-    
-    // エンコーダLEDを撮影中色（赤）に変更
-    if (g_encoder_ready) {
-        g_encoder->set_color(0xFF0000); // 赤色
-    }
-    
-    // ディスプレイに撮影メッセージを表示
-    if (g_display_ready) {
-        g_display->clear();
-        g_display->draw_string(0, 0, "Capture Mode", true);
-        g_display->draw_string(0, 16, "ALL Palettes", true);
-        g_display->draw_string(0, 32, "Processing...", true);
-        g_display->display();
-    }
-    
-    // 3秒後に待機状態に戻る
-    vTaskDelay(pdMS_TO_TICKS(3000));
-    
-    if (g_encoder_ready) {
-        g_encoder->set_color(PALETTE_REP_COLORS[g_current_palette_index]);
-    }
-}
-
-/**
- * @brief メニューボタンの短押し処理
- */
-void handle_menu_short_press(void) {
-    ESP_LOGI(TAG, "⚙️  メニューボタン短押し: 設定画面表示");
-    
-    // エンコーダLEDをメニュー色（紫）に変更
-    if (g_encoder_ready) {
-        g_encoder->set_color(0x8000FF); // 紫色
-    }
-    
-    // ディスプレイに設定メニューを表示
-    if (g_display_ready) {
-        g_display->clear();
-        g_display->draw_string(0, 0, "Settings Menu", true);
-        g_display->draw_string(0, 16, "Photos", true);
-        g_display->draw_string(0, 24, "Palettes", true);
-        g_display->draw_string(0, 32, "Resolution", true);
-        g_display->draw_string(0, 48, "Press to select", true);
-        g_display->display();
-    }
-    
-    // 3秒後に待機状態に戻る
-    vTaskDelay(pdMS_TO_TICKS(3000));
-    
-    if (g_encoder_ready) {
-        g_encoder->set_color(PALETTE_REP_COLORS[g_current_palette_index]);
-    }
-}
-
-/**
- * @brief メニューボタンの長押し処理
- */
-void handle_menu_long_press(void) {
-    ESP_LOGI(TAG, "⚙️  メニューボタン長押し: システム設定画面");
-    
-    // エンコーダLEDをシステム設定色（白）に変更
-    if (g_encoder_ready) {
-        g_encoder->set_color(0xFFFFFF); // 白色
-    }
-    
-    // ディスプレイにシステム情報を表示
-    if (g_display_ready) {
-        g_display->clear();
-        g_display->draw_string(0, 0, "System Info", true);
-        g_display->draw_string(0, 16, "Camera:", true);
-        g_display->draw_string(56, 16, g_camera_ready ? "OK" : "NG", g_camera_ready);
-        g_display->draw_string(0, 24, "Encoder:", true);
-        g_display->draw_string(56, 24, g_encoder_ready ? "OK" : "NG", g_encoder_ready);
-        g_display->draw_string(0, 32, "SD Card:", true);
-        g_display->draw_string(56, 32, g_sd_card_ready ? "OK" : "NG", g_sd_card_ready);
-        g_display->display();
-    }
-    
-    // 4秒後に待機状態に戻る
-    vTaskDelay(pdMS_TO_TICKS(4000));
-    
-    if (g_encoder_ready) {
-        g_encoder->set_color(PALETTE_REP_COLORS[g_current_palette_index]);
-    }
-}
-
-/**
- * @brief ボタンイベントを処理する関数
- */
-void process_button_events(void) {
     // シャッターボタンの処理
-    if (g_shutter_button.short_press_detected) {
-        g_shutter_button.short_press_detected = false;
-        handle_shutter_short_press();
-    }
-    
-    if (g_shutter_button.long_press_detected) {
-        // 長押しは一度だけ処理するため、ここでフラグをクリア
-        g_shutter_button.long_press_detected = false;
-        handle_shutter_long_press();
+    if (g_shutter_button.current_state) {
+        uint32_t press_duration = now - g_shutter_button.press_start_time;
+        
+        // 長押し判定（一度だけ発火）
+        if (press_duration >= BUTTON_LONG_PRESS_MS && !g_shutter_button.long_press_triggered) {
+            g_shutter_button.long_press_triggered = true;
+            ESP_LOGI(TAG, "📸 シャッターボタン長押し → 全パレット撮影");
+            
+            // エンコーダーLEDを黄色に設定（全パレット撮影モード）
+            if (g_encoder_ready) {
+                g_encoder->set_color(0xFFFF00);
+            }
+            
+            // ディスプレイに撮影モード表示
+            if (g_display_ready) {
+                g_display->clear();
+                g_display->draw_string(0, 0, "Capture Mode", true);
+                g_display->draw_string(0, 16, "All Palettes", true);
+                g_display->draw_string(0, 32, "Processing...", true);
+                g_display->display();
+            }
+        }
+    } else if (g_shutter_button.last_state && !g_shutter_button.current_state) {
+        // ボタンが離された時の処理
+        uint32_t press_duration = now - g_shutter_button.press_start_time;
+        
+        if (press_duration < BUTTON_LONG_PRESS_MS && !g_shutter_button.long_press_triggered) {
+            // 短押し
+            ESP_LOGI(TAG, "📸 シャッターボタン短押し → 単一パレット撮影 (パレット%d)", g_current_palette_index);
+            
+            // エンコーダーLEDを白色に設定（単一パレット撮影）
+            if (g_encoder_ready) {
+                g_encoder->set_color(0xFFFFFF);
+                vTaskDelay(pdMS_TO_TICKS(200));
+                g_encoder->set_color(PALETTE_REP_COLORS[g_current_palette_index]);
+            }
+            
+            // ディスプレイに撮影情報表示
+            if (g_display_ready) {
+                g_display->clear();
+                g_display->draw_string(0, 0, "Capture Mode", true);
+                char palette_str[32];
+                snprintf(palette_str, sizeof(palette_str), "Palette: %d", g_current_palette_index);
+                g_display->draw_string(0, 16, palette_str, true);
+                g_display->draw_string(0, 32, "Processing...", true);
+                g_display->display();
+            }
+        }
+        
+        g_shutter_button.last_state = false;
     }
     
     // メニューボタンの処理
-    if (g_menu_button.short_press_detected) {
-        g_menu_button.short_press_detected = false;
-        handle_menu_short_press();
+    if (g_menu_button.current_state) {
+        uint32_t press_duration = now - g_menu_button.press_start_time;
+        
+        // 長押し判定
+        if (press_duration >= BUTTON_LONG_PRESS_MS && !g_menu_button.long_press_triggered) {
+            g_menu_button.long_press_triggered = true;
+            ESP_LOGI(TAG, "⚙️ メニューボタン長押し → システム情報表示");
+            
+            // システム情報をディスプレイに表示
+            if (g_display_ready) {
+                g_display->clear();
+                g_display->draw_string(0, 0, "System Info", true);
+                
+                char info_str[32];
+                snprintf(info_str, sizeof(info_str), "Cam: %s", g_camera_ready ? "OK" : "NG");
+                g_display->draw_string(0, 16, info_str, true);
+                
+                snprintf(info_str, sizeof(info_str), "Enc: %s", g_encoder_ready ? "OK" : "NG");
+                g_display->draw_string(0, 32, info_str, true);
+                
+                snprintf(info_str, sizeof(info_str), "SD: %s", g_sd_card_ready ? "OK" : "NG");
+                g_display->draw_string(0, 48, info_str, true);
+                
+                g_display->display();
+            }
+        }
+    } else if (g_menu_button.last_state && !g_menu_button.current_state) {
+        // ボタンが離された時の処理
+        uint32_t press_duration = now - g_menu_button.press_start_time;
+        
+        if (press_duration < BUTTON_LONG_PRESS_MS && !g_menu_button.long_press_triggered) {
+            // 短押し
+            ESP_LOGI(TAG, "⚙️ メニューボタン短押し → 設定メニュー");
+            
+            // エンコーダーLEDテストを実行
+            if (g_encoder_ready) {
+                ESP_LOGI(TAG, "🎨 LEDテスト開始");
+                g_encoder->test_led_colors();
+                g_encoder->set_color(PALETTE_REP_COLORS[g_current_palette_index]);
+            }
+            
+            // ディスプレイにメニュー表示
+            if (g_display_ready) {
+                g_display->clear();
+                g_display->draw_string(0, 0, "Settings Menu", true);
+                g_display->draw_string(0, 16, "LED Test Done", true);
+                g_display->draw_string(0, 32, "Use encoder", true);
+                g_display->draw_string(0, 48, "to select", true);
+                g_display->display();
+            }
+        }
+        
+        g_menu_button.last_state = false;
+    }
+}
+
+/**
+ * GPIO初期化関数
+ */
+esp_err_t init_gpio()
+{
+    // ボタン用GPIO設定（プルアップ）
+    gpio_config_t button_config = {};
+    button_config.pin_bit_mask = (1ULL << SHUTTER_BUTTON_PIN) | (1ULL << MENU_BUTTON_PIN);
+    button_config.mode = GPIO_MODE_INPUT;
+    button_config.pull_up_en = GPIO_PULLUP_ENABLE;
+    button_config.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    button_config.intr_type = GPIO_INTR_DISABLE;
+    
+    esp_err_t ret = gpio_config(&button_config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "ボタンGPIO設定失敗: %s", esp_err_to_name(ret));
+        return ret;
     }
     
-    if (g_menu_button.long_press_detected) {
-        // 長押しは一度だけ処理するため、ここでフラグをクリア
-        g_menu_button.long_press_detected = false;
-        handle_menu_long_press();
+    ESP_LOGI(TAG, "✅ ボタンGPIO初期化完了 (GPIO%d, GPIO%d)", SHUTTER_BUTTON_PIN, MENU_BUTTON_PIN);
+    return ESP_OK;
+}
+
+// ========================================
+// エンコーダータスク
+// ========================================
+
+/**
+ * エンコーダー専用タスク関数
+ * エンコーダーの値変化を監視し、LEDの色を更新する
+ */
+void encoder_task(void* parameter)
+{
+    ESP_LOGI(TAG, "🔄 エンコーダータスク開始");
+    
+    int16_t last_encoder_value = 0;
+    uint32_t last_update_time = 0;
+    
+    // エンコーダー接続確認
+    if (g_encoder_ready) {
+        bool connection_ok = g_encoder->check_encoder_connection();
+        ESP_LOGI(TAG, "エンコーダー接続状態: %s", connection_ok ? "OK" : "NG");
+    }
+    
+    while (1) {
+        if (g_encoder_ready) {
+            // エンコーダー値を更新
+            int16_t current_value = g_encoder->update();
+            uint32_t current_time = esp_timer_get_time() / 1000;
+            
+            // 値が変化した場合の処理
+            if (current_value != last_encoder_value) {
+                int16_t delta = current_value - last_encoder_value;
+                
+                ESP_LOGI(TAG, "🔄 エンコーダー値変更: %d → %d (Δ%d)", 
+                        last_encoder_value, current_value, delta);
+                
+                // パレットインデックスを更新
+                g_current_palette_index = current_value;
+                
+                // LEDの色を変更
+                if (current_value < MAX_PALETTE_INDEX) {
+                    uint32_t color = PALETTE_REP_COLORS[current_value];
+                    esp_err_t led_result = g_encoder->set_color(color);
+                    
+                    if (led_result == ESP_OK) {
+                        ESP_LOGI(TAG, "🎨 LED色変更成功: パレット%d → 0x%06lX", 
+                                current_value, (unsigned long)color);
+                    } else {
+                        ESP_LOGW(TAG, "LED色変更失敗: %s", esp_err_to_name(led_result));
+                    }
+                }
+                
+                // ディスプレイを更新（頻繁な更新を防ぐため100ms間隔制限）
+                if (g_display_ready && (current_time - last_update_time) > 100) {
+                    g_display->clear();
+                    g_display->draw_string(0, 0, "Palette Mode", true);
+                    
+                    char palette_str[32];
+                    snprintf(palette_str, sizeof(palette_str), "Current: %d", current_value);
+                    g_display->draw_string(0, 16, palette_str, true);
+                    
+                    char color_str[32];
+                    snprintf(color_str, sizeof(color_str), "Color:0x%06lX", 
+                            (unsigned long)PALETTE_REP_COLORS[current_value]);
+                    g_display->draw_string(0, 32, color_str, true);
+                    
+                    g_display->draw_string(0, 48, "Press buttons", true);
+                    g_display->display();
+                    
+                    last_update_time = current_time;
+                }
+                
+                // エンコーダーイベントをキューに送信（他のタスクで使用可能）
+                if (g_encoder_event_queue != NULL) {
+                    encoder_event_t event = {
+                        .value = current_value,
+                        .delta = delta,
+                        .timestamp = current_time
+                    };
+                    
+                    if (xQueueSend(g_encoder_event_queue, &event, 0) != pdTRUE) {
+                        ESP_LOGW(TAG, "エンコーダーイベントキュー満杯");
+                    }
+                }
+                
+                last_encoder_value = current_value;
+            }
+        } else {
+            // エンコーダーが初期化されていない場合は長めに待機
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+        
+        // エンコーダータスクは高い応答性のため10ms周期で実行
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
@@ -549,7 +610,6 @@ esp_err_t init_external_i2c(void)
     }
 
     // I2Cドライバーをインストール
-    // (ポート番号, モード, スレーブ受信バッファサイズ, スレーブ送信バッファサイズ, 割り込みフラグ)
     ret = i2c_driver_install(EXTERNAL_I2C_NUM, external_i2c_config.mode, 0, 0, 0);
     if (ret != ESP_OK)
     {
@@ -602,7 +662,7 @@ extern "C" void app_main()
     ESP_LOGI(TAG, "\n\n");
     ESP_LOGI(TAG, "╔══════════════════════════════════════════════╗");
     ESP_LOGI(TAG, "║  📸 ピクセルアートカメラ ESP-IDF 5.4版 📸  ║");
-    ESP_LOGI(TAG, "║       🎨 8色パレット + ボタン機能 🎨       ║");
+    ESP_LOGI(TAG, "║    🎨 エンコーダーとLEDテスト対応版 🎨     ║");
     ESP_LOGI(TAG, "╚══════════════════════════════════════════════╝");
     ESP_LOGI(TAG, "🔧 ESP-IDF Version: %s", esp_get_idf_version());
 
@@ -634,16 +694,14 @@ extern "C" void app_main()
     }
 
     // ========================================
-    // ボタン初期化（新機能）
+    // GPIO初期化（ボタン）
     // ========================================
-    ESP_LOGI(TAG, "\n🔘 === ボタン初期化開始 ===");
-    esp_err_t button_result = init_buttons();
-    if (button_result == ESP_OK) {
-        ESP_LOGI(TAG, "✅ ボタン初期化成功");
-        ESP_LOGI(TAG, "   シャッターボタン (GPIO%d): 短押し=単一パレット, 長押し=全パレット", SHUTTER_BUTTON_PIN);
-        ESP_LOGI(TAG, "   メニューボタン (GPIO%d): 短押し=メニュー, 長押し=システム情報", MENU_BUTTON_PIN);
+    ESP_LOGI(TAG, "🔘 GPIO初期化中...");
+    esp_err_t gpio_result = init_gpio();
+    if (gpio_result != ESP_OK) {
+        ESP_LOGE(TAG, "❌ GPIO初期化失敗: %s", esp_err_to_name(gpio_result));
     } else {
-        ESP_LOGE(TAG, "❌ ボタン初期化失敗: %s", esp_err_to_name(button_result));
+        ESP_LOGI(TAG, "✅ GPIO初期化成功");
     }
 
     // ========================================
@@ -677,6 +735,19 @@ extern "C" void app_main()
     {
         ESP_LOGE(TAG, "❌ カメラオブジェクト作成失敗");
         g_camera_ready = false;
+    }
+
+    // ========================================
+    // 同期オブジェクト作成
+    // ========================================
+    ESP_LOGI(TAG, "🔄 同期オブジェクト作成中...");
+    
+    // エンコーダーイベントキュー作成
+    g_encoder_event_queue = xQueueCreate(10, sizeof(encoder_event_t));
+    if (g_encoder_event_queue == NULL) {
+        ESP_LOGE(TAG, "❌ エンコーダーイベントキュー作成失敗");
+    } else {
+        ESP_LOGI(TAG, "✅ エンコーダーイベントキュー作成成功");
     }
 
     ESP_LOGI(TAG, "\n🔧 === I2Cバス初期化開始 ===");
@@ -723,6 +794,13 @@ extern "C" void app_main()
             // エンコーダー設定
             g_encoder->set_value_range(0, MAX_PALETTE_INDEX - 1);
             g_encoder->set_color(0x004000); // 緑色で初期化完了を表示
+            
+            // LEDテストを実行
+            ESP_LOGI(TAG, "🎨 エンコーダーLEDテスト開始");
+            g_encoder->test_led_colors();
+            
+            // 初期パレット色に設定
+            g_encoder->set_color(PALETTE_REP_COLORS[0]);
         }
         else
         {
@@ -755,7 +833,8 @@ extern "C" void app_main()
             g_display->clear();
             g_display->draw_string(0, 0, "PixelArt Camera", true);
             g_display->draw_string(0, 16, "ESP-IDF 5.4", true);
-            g_display->draw_string(0, 32, "Button Ready!", true);
+            g_display->draw_string(0, 32, "Encoder Test", true);
+            g_display->draw_string(0, 48, "Initializing...", true);
             g_display->display();
         }
         else
@@ -795,8 +874,8 @@ extern "C" void app_main()
     // 初期化結果サマリー
     // ========================================
     ESP_LOGI(TAG, "\n📋 === 初期化結果サマリー ===");
-    ESP_LOGI(TAG, "ボタン:                   %s",
-             button_result == ESP_OK ? "✅ 成功" : "❌ 失敗");
+    ESP_LOGI(TAG, "GPIO:                     %s",
+             gpio_result == ESP_OK ? "✅ 成功" : "❌ 失敗");
     ESP_LOGI(TAG, "外部装置I2C (I2C_NUM_1):   %s",
              external_i2c_result == ESP_OK ? "✅ 成功" : "❌ 失敗");
     ESP_LOGI(TAG, "カメラ:                   %s",
@@ -810,29 +889,28 @@ extern "C" void app_main()
 
     // 全デバイス成功チェック
     int success_count = 0;
-    if (button_result == ESP_OK) success_count++;
+    if (gpio_result == ESP_OK) success_count++;
     if (external_i2c_result == ESP_OK) success_count++;
     if (g_camera_ready) success_count++;
     if (g_encoder_ready) success_count++;
     if (g_display_ready) success_count++;
     if (g_sd_card_ready) success_count++;
 
-    ESP_LOGI(TAG, "\n🎯 初期化完了: %d/6 成功", success_count);
+    ESP_LOGI(TAG, "\n🎯 初期化完了: %d/7 成功", success_count);
 
-    if (success_count >= 4)
+    if (success_count >= 5)
     { // 最低限の機能が動作
-        ESP_LOGI(TAG, "🎉 システム初期化完了！ボタン機能テスト開始");
+        ESP_LOGI(TAG, "🎉 システム初期化完了！エンコーダーとLEDテスト準備OK");
         g_system_ready = true;
 
-        // ディスプレイに使用方法を表示
+        // ディスプレイに成功メッセージ表示
         if (g_display_ready)
         {
             g_display->clear();
-            g_display->draw_string(0, 0, "Button Test", true);
-            g_display->draw_string(0, 16, "GPIO38: Shutter", true);
-            g_display->draw_string(0, 24, "GPIO39: Menu", true);
-            g_display->draw_string(0, 40, "Short/Long Press", true);
-            g_display->draw_string(0, 56, "Ready!", true);
+            g_display->draw_string(0, 0, "System Ready!", true);
+            g_display->draw_string(0, 16, "Encoder Test", true);
+            g_display->draw_string(0, 32, "Mode Active", true);
+            g_display->draw_string(0, 48, "Turn encoder!", true);
             g_display->display();
         }
 
@@ -862,11 +940,33 @@ extern "C" void app_main()
         }
     }
 
+    // ========================================
+    // エンコーダータスク開始
+    // ========================================
+    if (g_encoder_ready) {
+        ESP_LOGI(TAG, "🔄 エンコーダータスク作成中...");
+        BaseType_t task_result = xTaskCreate(
+            encoder_task,           // タスク関数
+            "encoder_task",         // タスク名
+            ENCODER_TASK_STACK,     // スタックサイズ
+            NULL,                   // パラメータ
+            tskIDLE_PRIORITY + 2,   // 優先度（高め）
+            NULL                    // タスクハンドル
+        );
+        
+        if (task_result == pdPASS) {
+            ESP_LOGI(TAG, "✅ エンコーダータスク作成成功");
+        } else {
+            ESP_LOGE(TAG, "❌ エンコーダータスク作成失敗");
+        }
+    }
+
     ESP_LOGI(TAG, "\n🔘 ボタンテストモード開始");
     ESP_LOGI(TAG, "   GPIO%d (シャッター): 短押し=単一パレット撮影, 長押し=全パレット撮影", SHUTTER_BUTTON_PIN);
-    ESP_LOGI(TAG, "   GPIO%d (メニュー): 短押し=設定メニュー, 長押し=システム情報", MENU_BUTTON_PIN);
+    ESP_LOGI(TAG, "   GPIO%d (メニュー): 短押し=LEDテスト, 長押し=システム情報", MENU_BUTTON_PIN);
+    ESP_LOGI(TAG, "   エンコーダー: 回転でパレット選択とLED色変更");
 
-    // メインループ（ボタン処理とエンコーダー更新）
+    // メインループ（ボタン処理メイン）
     while (1)
     {
         // ボタン状態を更新
@@ -876,38 +976,8 @@ extern "C" void app_main()
         // ボタンイベントを処理
         process_button_events();
         
-        // エンコーダー値更新
-        if (g_encoder_ready)
-        {
-            int current_value = g_encoder->update();
-            static int last_value = -1;
-            if (current_value != last_value)
-            {
-                ESP_LOGI(TAG, "🔄 エンコーダー値変更: %d", current_value);
-                last_value = current_value;
-
-                // パレット表示色を変更
-                if (current_value < MAX_PALETTE_INDEX)
-                {
-                    g_encoder->set_color(PALETTE_REP_COLORS[current_value]);
-                    g_current_palette_index = current_value;
-                }
-
-                // ディスプレイに現在のパレット番号を表示
-                if (g_display_ready)
-                {
-                    g_display->clear();
-                    g_display->draw_string(0, 0, "Palette Mode", true);
-                    char palette_str[32];
-                    snprintf(palette_str, sizeof(palette_str), "Current: %d", current_value);
-                    g_display->draw_string(0, 16, palette_str, true);
-                    g_display->draw_string(0, 32, "Press buttons", true);
-                    g_display->draw_string(0, 48, "to test!", true);
-                    g_display->display();
-                }
-            }
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(20)); // 20ms周期で更新（ボタン応答性向上）
+        // メインループは20ms周期（ボタン応答性重視）
+        // エンコーダーは専用タスクで10ms周期で処理
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
