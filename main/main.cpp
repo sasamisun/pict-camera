@@ -1,10 +1,21 @@
 /*
  * AtomS3R ピクセルアートカメラ (ESP-IDF 5.4完全対応版)
  *
- * 新機能追加:
- * - ステータス表示用LEDエンコーダ制御にゃ
- * - 赤点滅: 操作禁止時（起動・撮影・書き込み中）
- * - 青点灯: 操作可能時（待機中）
+ * ToDo:
+ * G38 G39プルアップボタン入力（シャッターボタン・メニューボタン）
+ * encoder 入力、LEDテスト
+ * LCD表示テスト フォント準備 M5GFX
+ * カメラからLCD表示
+ * カメラ画像をカラーパレットをもとに変換（短押し１パレット、長押し全パレット）
+ * カメラ画像をSDカードに保存
+ * エンコーダで露出補正、明度マップ表示
+ * メニュー作成　メニューボタンで移行　シャッターボタンで決定　エンコーダで選択　メニューボタンで戻る
+ * 　メニュー内容（Photos,Pallets,Resolution,
+ * 
+ * 以下、ふわふわ要件
+ * RFIDで画像送信機能
+ * 吹き出し機能
+ * 
  */
 
 #include <stdio.h>
@@ -22,9 +33,9 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "nvs_flash.h"
-// ESP-IDF 5.4では esp_psram.h の代わりに esp_heap_caps.h を使うにゃ
+// ESP-IDF 5.4では esp_psram.h の代わりに esp_heap_caps.h を使う
 #include "esp_heap_caps.h"
-#include "esp_chip_info.h" // esp_chip_info用にゃ
+#include "esp_chip_info.h" // esp_chip_info用
 
 // ドライバー (ESP-IDF 5.4対応)
 #include "driver/gpio.h"
@@ -55,7 +66,7 @@
 
 
 // ========================================
-// 定数定義にゃ
+// 定数定義
 // ========================================
 static const char *TAG = "PixelArtCamera";
 
@@ -65,7 +76,6 @@ static const char *TAG = "PixelArtCamera";
 #define SPI_MOSI_PIN GPIO_NUM_6
 #define SPI_CS_PIN GPIO_NUM_15
 
-#define CAMERA_POWER_PIN GPIO_NUM_18 // カメラ電源制御
 #define BUTTON_PIN GPIO_NUM_38       // 撮影ボタン
 #define LED_PIN GPIO_NUM_39          // 状態LED
 
@@ -113,16 +123,6 @@ typedef enum
 static SemaphoreHandle_t g_capture_semaphore = NULL;
 static SemaphoreHandle_t g_i2c_mutex = NULL;
 static QueueHandle_t g_capture_queue = NULL;
-
-// ハードウェア
-// static i2c_master_bus_handle_t g_i2c_bus_handle = NULL; // 新しいI2Cバスハンドル
-// static PimoroniEncoder *g_encoder = nullptr;
-// static PixelArtProcessor *g_processor = nullptr;
-// static CameraUtils *g_camera_utils = nullptr;
-
-// SSD1306ディスプレイオブジェクト
-// static SSD1306Display *g_display = nullptr;
-static bool g_display_enabled = false;
 
 // 状態管理
 static volatile int g_current_palette_index = 0;

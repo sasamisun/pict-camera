@@ -16,24 +16,6 @@
 #include "esp_heap_caps.h"
 #include "driver/i2c.h"
 
-// AtomS3R カメラピン設定
-#define CAMERA_POWER_PIN    GPIO_NUM_18     // カメラ電源制御
-#define CAMERA_PIN_PWDN     GPIO_NUM_NC     // パワーダウンピン（未使用）
-#define CAMERA_PIN_RESET    GPIO_NUM_NC     // リセットピン（未使用）
-#define CAMERA_PIN_XCLK     GPIO_NUM_21     // 外部クロック
-#define CAMERA_PIN_SIOD     GPIO_NUM_12     // I2C SDA (SCCB)
-#define CAMERA_PIN_SIOC     GPIO_NUM_9      // I2C SCL (SCCB)
-
-// データピン
-#define CAMERA_PIN_D7       GPIO_NUM_13
-#define CAMERA_PIN_D6       GPIO_NUM_11
-#define CAMERA_PIN_D5       GPIO_NUM_17
-#define CAMERA_PIN_D4       GPIO_NUM_4
-#define CAMERA_PIN_D3       GPIO_NUM_48
-#define CAMERA_PIN_D2       GPIO_NUM_46
-#define CAMERA_PIN_D1       GPIO_NUM_42
-#define CAMERA_PIN_D0       GPIO_NUM_3
-
 // 制御ピン
 #define CAMERA_PIN_VSYNC    GPIO_NUM_10     // 垂直同期
 #define CAMERA_PIN_HREF     GPIO_NUM_14     // 水平同期
