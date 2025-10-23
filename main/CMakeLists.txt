@@ -1,7 +1,7 @@
 idf_component_register(
     SRCS
         "main.cpp"
-        "PimoroniEncoder.cpp"
+       
         #"PixelArtProcessor.cpp"
         "camera_utils.cpp"
         "ssd1306_display.cpp"
