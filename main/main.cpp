@@ -1,6 +1,6 @@
 /*
  * AtomS3R ピクセルアートカメラ (ESP-IDF 5.4完全対応版)
- * エンコーダー関連修正版
+ * SSD1306ディスプレイ動作テスト版
  */
 
 #include <stdio.h>
@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <sys/unistd.h>
 #include <sys/stat.h>
+#include <math.h>
 
 // ESP-IDF 5.4コア
 #include "freertos/FreeRTOS.h"
@@ -181,6 +182,164 @@ void print_sd_card_info(void);
 esp_err_t init_external_i2c(void);
 esp_err_t scan_i2c_devices(i2c_port_t i2c_num, int *found_devices);
 esp_err_t init_gpio(void);
+void run_display_test_patterns(void);
+
+// ★★★ 新規追加: SSD1306表示テスト関数 ★★★
+void run_display_test_patterns(void)
+{
+    if (!g_display_ready || g_display == nullptr) {
+        ESP_LOGE(TAG, "❌ ディスプレイが準備できていません");
+        return;
+    }
+    
+    ESP_LOGI(TAG, "🎨 SSD1306テストパターン表示開始");
+    
+    // テスト1: 全画面クリア確認
+    ESP_LOGI(TAG, "テスト1: 全画面クリア確認");
+    g_display->clear();
+    g_display->display();
+    vTaskDelay(pdMS_TO_TICKS(500));
+    
+    // テスト2: 全画面白表示
+    ESP_LOGI(TAG, "テスト2: 全画面白表示");
+    for (int y = 0; y < 64; y++) {
+        for (int x = 0; x < 128; x++) {
+            g_display->set_pixel(x, y, true);
+        }
+    }
+    g_display->display();
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    
+    // テスト3: 格子パターン表示
+    ESP_LOGI(TAG, "テスト3: 格子パターン表示");
+    g_display->clear();
+    for (int y = 0; y < 64; y += 8) {
+        g_display->draw_hline(0, y, 128, true);
+    }
+    for (int x = 0; x < 128; x += 16) {
+        g_display->draw_vline(x, 0, 64, true);
+    }
+    g_display->display();
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    
+    // テスト4: 矩形パターン表示
+    ESP_LOGI(TAG, "テスト4: 矩形パターン表示");
+    g_display->clear();
+    g_display->draw_rect(0, 0, 128, 64, true, false);      // 外枠
+    g_display->draw_rect(10, 10, 108, 44, true, false);    // 内枠
+    g_display->draw_rect(20, 20, 88, 24, true, true);      // 塗りつぶし矩形
+    g_display->display();
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    
+    // テスト5: チェッカーボードパターン表示
+    ESP_LOGI(TAG, "テスト5: チェッカーボードパターン表示");
+    g_display->clear();
+    for (int y = 0; y < 64; y++) {
+        for (int x = 0; x < 128; x++) {
+            if (((x / 8) + (y / 8)) % 2 == 0) {
+                g_display->set_pixel(x, y, true);
+            }
+        }
+    }
+    g_display->display();
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    
+    // テスト6: アニメーション（移動する点）
+    ESP_LOGI(TAG, "テスト6: アニメーション表示");
+    for (int frame = 0; frame < 100; frame++) {
+        g_display->clear();
+        
+        // 移動する点
+        int x = (frame * 2) % 128;
+        int y = 32 + (int)(16.0f * sin(frame * 0.1f));
+        g_display->set_pixel(x, y, true);
+        
+        // 移動する円（疑似円）
+        int cx = 64 + (int)(32.0f * cos(frame * 0.05f));
+        int cy = 32 + (int)(16.0f * sin(frame * 0.05f));
+        for (int i = 0; i < 8; i++) {
+            int px = cx + (int)(5.0f * cos(i * 0.785f)); // 0.785 ≈ π/4
+            int py = cy + (int)(5.0f * sin(i * 0.785f));
+            if (px >= 0 && px < 128 && py >= 0 && py < 64) {
+                g_display->set_pixel(px, py, true);
+            }
+        }
+        
+        g_display->display();
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    
+    // テスト7: 簡単な文字描画テスト（ビットマップ）
+    ESP_LOGI(TAG, "テスト7: 文字ビットマップ表示");
+    g_display->clear();
+    
+    // "OK" の文字パターン (8x8)
+    uint8_t char_O[8] = {
+        0b00111100,
+        0b01100110,
+        0b11000011,
+        0b11000011,
+        0b11000011,
+        0b11000011,
+        0b01100110,
+        0b00111100
+    };
+    
+    uint8_t char_K[8] = {
+        0b11000011,
+        0b11000110,
+        0b11001100,
+        0b11111000,
+        0b11111000,
+        0b11001100,
+        0b11000110,
+        0b11000011
+    };
+    
+    // "O" を描画
+    for (int y = 0; y < 8; y++) {
+        for (int x = 0; x < 8; x++) {
+            if (char_O[y] & (1 << (7 - x))) {
+                g_display->set_pixel(48 + x, 20 + y, true);
+            }
+        }
+    }
+    
+    // "K" を描画
+    for (int y = 0; y < 8; y++) {
+        for (int x = 0; x < 8; x++) {
+            if (char_K[y] & (1 << (7 - x))) {
+                g_display->set_pixel(64 + x, 20 + y, true);
+            }
+        }
+    }
+    
+    g_display->display();
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    
+    // 最終表示: ステータス表示
+    ESP_LOGI(TAG, "テスト8: ステータス表示");
+    g_display->clear();
+    
+    // ステータス表示用のドット（デバイス状態を視覚的に表示）
+    g_display->set_pixel(10, 10, g_camera_ready);     // カメラ状態
+    g_display->set_pixel(20, 10, g_encoder_ready);    // エンコーダー状態
+    g_display->set_pixel(30, 10, g_display_ready);    // ディスプレイ状態（自分自身）
+    g_display->set_pixel(40, 10, g_sd_card_ready);    // SDカード状態
+    
+    // パレット番号を表示（簡単なパターンで）
+    int palette_dots = g_current_palette_index + 1;
+    for (int i = 0; i < palette_dots && i < 8; i++) {
+        g_display->set_pixel(60 + i * 4, 30, true);
+    }
+    
+    // 枠線を描画
+    g_display->draw_rect(5, 5, 118, 54, true, false);
+    
+    g_display->display();
+    
+    ESP_LOGI(TAG, "✅ SSD1306テストパターン完了 - 表示テスト成功");
+}
 
 // ボタン処理関数群（省略、元のファイルと同じ）
 void update_button_state(button_state_t* button)
@@ -236,7 +395,10 @@ void process_button_events(void)
     button_event_t shutter_event = get_button_event(&g_shutter_button);
     switch (shutter_event) {
         case BUTTON_EVENT_SHORT_PRESS:
-            ESP_LOGI(TAG, "📸 シャッター短押し: 単一パレット撮影 (パレット%d)", g_current_palette_index);
+            ESP_LOGI(TAG, "📸 シャッター短押し: ディスプレイテスト再実行");
+            if (g_display_ready) {
+                run_display_test_patterns();
+            }
             break;
         case BUTTON_EVENT_LONG_PRESS:
             ESP_LOGI(TAG, "📸 シャッター長押し: 全パレット撮影");
@@ -324,22 +486,28 @@ void encoder_task(void* parameter)
                     ESP_LOGW(TAG, "LED色変更失敗: %s", esp_err_to_name(led_result));
                 }
                 
-                // ディスプレイを更新
+                // ディスプレイを更新（簡単なステータス表示）
                 if (g_display_ready && (current_time - last_update_time) > 100) {
                     g_display->clear();
-                    g_display->draw_string(0, 0, "Palette Mode", true);
                     
-                    char palette_str[32];
-                    snprintf(palette_str, sizeof(palette_str), "Current: %d", current_value);
-                    g_display->draw_string(0, 16, palette_str, true);
+                    // パレット番号を表示（簡単なパターンで）
+                    int palette_dots = current_value + 1;
+                    for (int i = 0; i < palette_dots && i < 8; i++) {
+                        g_display->set_pixel(10 + i * 8, 10, true);
+                    }
                     
-                    char color_str[32];
-                    snprintf(color_str, sizeof(color_str), "RGB:%d,%d,%d", r, g, b);
-                    g_display->draw_string(0, 32, color_str, true);
+                    // RGB値を簡単なバーで表示
+                    for (int i = 0; i < r/8 && i < 32; i++) {
+                        g_display->set_pixel(10 + i, 25, true); // R
+                    }
+                    for (int i = 0; i < g/8 && i < 32; i++) {
+                        g_display->set_pixel(10 + i, 35, true); // G
+                    }
+                    for (int i = 0; i < b/8 && i < 32; i++) {
+                        g_display->set_pixel(10 + i, 45, true); // B
+                    }
                     
-                    g_display->draw_string(0, 48, "Press buttons", true);
                     g_display->display();
-                    
                     last_update_time = current_time;
                 }
                 
@@ -491,20 +659,24 @@ extern "C" void app_main(void)
         g_encoder_ready = false;
     }
 
-    // ディスプレイ初期化
+    // ★★★ SSD1306ディスプレイ初期化とテストパターン表示 ★★★
+    ESP_LOGI(TAG, "📺 SSD1306ディスプレイ初期化中...");
     g_display = new SSD1306Display(EXTERNAL_I2C_NUM, SSD1306_DEFAULT_ADDR);
     if (g_display != nullptr) {
         esp_err_t display_result = g_display->init();
         if (display_result == ESP_OK) {
             ESP_LOGI(TAG, "✅ ディスプレイ初期化成功");
             g_display_ready = true;
-            g_display->clear();
-            g_display->draw_string(0, 0, "PixelArt Camera", true);
-            g_display->draw_string(0, 16, "ESP-IDF 5.4", true);
-            g_display->draw_string(0, 32, "Encoder Test", true);
-            g_display->draw_string(0, 48, "Initializing...", true);
-            g_display->display();
+            
+            // ディスプレイ動作確認用テストパターン表示
+            ESP_LOGI(TAG, "🎨 ディスプレイテストパターン実行中...");
+            run_display_test_patterns();
+            
+        } else {
+            ESP_LOGE(TAG, "❌ ディスプレイ初期化失敗: %s", esp_err_to_name(display_result));
         }
+    } else {
+        ESP_LOGE(TAG, "❌ ディスプレイオブジェクト作成失敗");
     }
 
     // システム準備完了
@@ -518,6 +690,9 @@ extern "C" void app_main(void)
     }
 
     ESP_LOGI(TAG, "🔘 ボタンテストモード開始");
+    ESP_LOGI(TAG, "   シャッター短押し: ディスプレイテスト再実行");
+    ESP_LOGI(TAG, "   メニュー短押し: LEDテスト実行");
+    ESP_LOGI(TAG, "   メニュー長押し: システム情報表示");
 
     // メインループ
     while (1) {
