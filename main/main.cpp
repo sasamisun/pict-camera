@@ -193,96 +193,22 @@ void run_display_test_patterns(void)
         return;
     }
 
-    ESP_LOGI(TAG, "🎨 ディスプレイ描画テスト開始");
+    ESP_LOGI(TAG, "🎨 スプラッシュ画面＋ターミナル");
 
-    // テスト1: ビットマップ画像表示（通常）
-    ESP_LOGI(TAG, "テスト1: ビットマップ画像表示（通常）");
+    ESP_LOGI(TAG, "ビットマップ画像表示（通常）");
     g_display->clear();
-    g_display->draw_rect(0, 0, 128, 64, true, false);
     g_display->draw_bitmap(image_logo, IMAGE_DATA_WIDTH, IMAGE_DATA_HEIGHT, 0, 0, false);
     g_display->display();
-    vTaskDelay(pdMS_TO_TICKS(2000));
 
-    // テスト2: ビットマップ画像表示（反転）
-    ESP_LOGI(TAG, "テスト2: ビットマップ画像表示（反転）");
-    g_display->clear();
-    g_display->draw_rect(0, 0, 128, 64, true, false);
-    g_display->draw_bitmap(image_logo, IMAGE_DATA_WIDTH, IMAGE_DATA_HEIGHT, 0, 12, true);
-    g_display->display();
-    vTaskDelay(pdMS_TO_TICKS(2000));
-
-    // テスト3: 美咲フォント文字描画
-    ESP_LOGI(TAG, "テスト3: 美咲フォント文字描画");
-    g_display->clear();
-    g_display->draw_rect(0, 0, 128, 64, true, false);
-
-    // ランダムな位置にランダムな文字を表示（10文字）
-    for (int i = 0; i < 10; i++) {
-        uint16_t char_index = esp_random() % MISAKI_TOTAL_CHARS;
-        int16_t x = 1 + (esp_random() % 119);
-        int16_t y = 1 + (esp_random() % 55);
-        g_display->draw_char(char_index, x, y, true);
-    }
-
-    g_display->display();
-    vTaskDelay(pdMS_TO_TICKS(2000));
-
-    // テスト4: ターミナル表示（枠線なし）
-    ESP_LOGI(TAG, "テスト4: ターミナル表示（枠線なし）");
+    // 画像の下にターミナル表示
+    ESP_LOGI(TAG, "画像の下にターミナル表示（枠線なし）");
     Terminal terminal;
     terminal.init();
-    terminal.set_position(0, 0);
+    terminal.set_position(0, 40);
     terminal.set_border(false);
 
-    // いくつかの文字を配置
-    for (uint8_t row = 0; row < 8; row++) {
-        for (uint8_t col = 0; col < 16; col++) {
-            // チェッカーパターン
-            uint16_t char_index = ((row + col) % 2) ? 100 : 200;
-            terminal.set_char(row, col, char_index);
-        }
-    }
+    // todo: ここでターミナルにメッセージを表示するコードを追加
 
-    g_display->clear();
-    g_display->draw_terminal(&terminal);
-    g_display->display();
-    vTaskDelay(pdMS_TO_TICKS(2000));
-
-    // テスト5: ターミナル表示（枠線あり）
-    ESP_LOGI(TAG, "テスト5: ターミナル表示（枠線あり）");
-    terminal.clear();
-    terminal.set_border(true);
-
-    // print_char()を使って文字を出力
-    for (int i = 0; i < 50; i++) {
-        uint16_t char_index = 100 + (i % 200);
-        terminal.print_char(char_index);
-    }
-
-    g_display->clear();
-    g_display->draw_terminal(&terminal);
-    g_display->display();
-    vTaskDelay(pdMS_TO_TICKS(2000));
-
-    // テスト6: ターミナルスクロールテスト
-    ESP_LOGI(TAG, "テスト6: ターミナルスクロールテスト");
-    terminal.clear();
-    terminal.set_border(true);
-
-    // 1行ずつ追加してスクロールを確認
-    for (int line = 0; line < 12; line++) {
-        for (int col = 0; col < 18; col++) {
-            terminal.print_char(300 + (line * 10 + col) % 400);
-        }
-        terminal.newline();
-
-        g_display->clear();
-        g_display->draw_terminal(&terminal);
-        g_display->display();
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }
-
-    ESP_LOGI(TAG, "✅ ディスプレイ描画テスト完了");
 }
 
 // ボタン処理関数群（省略、元のファイルと同じ）
