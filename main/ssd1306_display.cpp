@@ -195,6 +195,146 @@ void SSD1306Display::set_pixel(int16_t x, int16_t y, bool white)
     set_pixel_in_buffer(x, y, white);
 }
 
+void SSD1306Display::draw_char(uint16_t char_index, int16_t x, int16_t y, bool white)
+{
+    ESP_LOGD(TAG, "文字描画: インデックス=%d, 位置=(%d,%d)", char_index, x, y);
+
+    // 範囲チェック
+    if (char_index >= MISAKI_TOTAL_CHARS) {
+        ESP_LOGW(TAG, "文字インデックスが範囲外: %d (最大: %d)", char_index, MISAKI_TOTAL_CHARS - 1);
+        return;
+    }
+
+    if (!_frame_buffer) {
+        ESP_LOGW(TAG, "フレームバッファが未初期化");
+        return;
+    }
+
+    // 美咲フォントデータを取得
+    const misaki_char_t* font_char = &misaki_font[char_index];
+
+    // 8x8ビットマップを描画
+    // 美咲フォントは右から左の列順で格納されている
+    for (int col = 0; col < MISAKI_CHAR_WIDTH; col++) {
+        uint8_t column_data = font_char->bitmap[col];
+
+        // 各列の8ビット（縦方向）を描画
+        for (int row = 0; row < MISAKI_CHAR_HEIGHT; row++) {
+            if (column_data & (1 << row)) {
+                // ビットが1の場合、指定色でピクセルを描画
+                set_pixel_in_buffer(x + col, y + row, white);
+            } else {
+                // ビットが0の場合、背景色（反転色）でピクセルを描画
+                set_pixel_in_buffer(x + col, y + row, !white);
+            }
+        }
+    }
+}
+
+void SSD1306Display::draw_bitmap(const uint8_t* bitmap, uint16_t width, uint16_t height,
+                                  int16_t x, int16_t y, bool invert)
+{
+    ESP_LOGD(TAG, "ビットマップ描画: サイズ=%dx%d, 位置=(%d,%d), 反転=%s",
+             width, height, x, y, invert ? "ON" : "OFF");
+
+    if (!_frame_buffer || !bitmap) {
+        ESP_LOGW(TAG, "フレームバッファまたはビットマップが無効");
+        return;
+    }
+
+    // 1行あたりのバイト数を計算（8ピクセル = 1バイト）
+    uint16_t bytes_per_row = (width + 7) / 8;
+
+    // 各行をループ
+    for (uint16_t row = 0; row < height; row++) {
+        // 描画先のY座標を計算
+        int16_t dest_y = y + row;
+
+        // Y座標のクリッピング
+        if (dest_y < 0 || dest_y >= SSD1306_HEIGHT) {
+            continue;
+        }
+
+        // 各バイト（8ピクセル分）をループ
+        for (uint16_t byte_col = 0; byte_col < bytes_per_row; byte_col++) {
+            // ビットマップデータのインデックスを計算
+            uint16_t bitmap_index = row * bytes_per_row + byte_col;
+            uint8_t bitmap_byte = bitmap[bitmap_index];
+
+            // 8ビットを展開してピクセルに変換
+            for (uint8_t bit = 0; bit < 8; bit++) {
+                // 描画先のX座標を計算
+                int16_t dest_x = x + (byte_col * 8) + bit;
+
+                // X座標のクリッピング
+                if (dest_x < 0 || dest_x >= SSD1306_WIDTH) {
+                    continue;
+                }
+
+                // ピクセルの幅を超えないようにチェック
+                if ((byte_col * 8 + bit) >= width) {
+                    break;
+                }
+
+                // ビットを取得（MSBが左端）
+                bool pixel_on = (bitmap_byte & (0x80 >> bit)) != 0;
+
+                // 反転フラグを適用
+                if (invert) {
+                    pixel_on = !pixel_on;
+                }
+
+                // ピクセルを描画
+                set_pixel_in_buffer(dest_x, dest_y, pixel_on);
+            }
+        }
+    }
+}
+
+void SSD1306Display::draw_terminal(const Terminal* terminal)
+{
+    if (!_frame_buffer || !terminal) {
+        ESP_LOGW(TAG, "フレームバッファまたはターミナルが無効");
+        return;
+    }
+
+    int16_t base_x = terminal->get_display_x();
+    int16_t base_y = terminal->get_display_y();
+    bool invert = terminal->get_invert();
+    bool show_border = terminal->get_show_border();
+
+    ESP_LOGD(TAG, "ターミナル描画: 位置=(%d,%d), 反転=%s, 枠線=%s",
+             base_x, base_y, invert ? "ON" : "OFF", show_border ? "ON" : "OFF");
+
+    // 枠線を描画
+    if (show_border) {
+        int16_t border_width = TERMINAL_COLS * MISAKI_CHAR_WIDTH + 2;
+        int16_t border_height = TERMINAL_ROWS * MISAKI_CHAR_HEIGHT + 2;
+        draw_rect(base_x, base_y, border_width, border_height, !invert, false);
+
+        // 枠線分オフセット
+        base_x += 1;
+        base_y += 1;
+    }
+
+    // 各文字を描画
+    for (uint8_t row = 0; row < TERMINAL_ROWS; row++) {
+        const uint16_t* row_buffer = terminal->get_buffer_row(row);
+        if (!row_buffer) continue;
+
+        for (uint8_t col = 0; col < TERMINAL_COLS; col++) {
+            uint16_t char_index = row_buffer[col];
+
+            // 文字位置を計算
+            int16_t char_x = base_x + (col * MISAKI_CHAR_WIDTH);
+            int16_t char_y = base_y + (row * MISAKI_CHAR_HEIGHT);
+
+            // 文字を描画
+            draw_char(char_index, char_x, char_y, !invert);
+        }
+    }
+}
+
 void SSD1306Display::draw_string(int16_t x, int16_t y, const char* text, bool white)
 {
     ESP_LOGI(TAG, "文字列描画: (%d,%d) \"%s\"", x, y, text);

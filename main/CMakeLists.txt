@@ -5,6 +5,7 @@ idf_component_register(
         #"PixelArtProcessor.cpp"
         "camera_utils.cpp"
         "ssd1306_display.cpp"
+        "terminal.cpp"
     INCLUDE_DIRS
         "."
     REQUIRES 

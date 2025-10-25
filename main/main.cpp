@@ -21,6 +21,7 @@
 #include "nvs_flash.h"
 #include "esp_heap_caps.h"
 #include "esp_chip_info.h"
+#include "esp_random.h"
 
 // ドライバー (ESP-IDF 5.4対応)
 #include "driver/gpio.h"
@@ -191,154 +192,97 @@ void run_display_test_patterns(void)
         ESP_LOGE(TAG, "❌ ディスプレイが準備できていません");
         return;
     }
-    
-    ESP_LOGI(TAG, "🎨 SSD1306テストパターン表示開始");
-    
-    // テスト1: 全画面クリア確認
-    ESP_LOGI(TAG, "テスト1: 全画面クリア確認");
+
+    ESP_LOGI(TAG, "🎨 ディスプレイ描画テスト開始");
+
+    // テスト1: ビットマップ画像表示（通常）
+    ESP_LOGI(TAG, "テスト1: ビットマップ画像表示（通常）");
     g_display->clear();
-    g_display->display();
-    vTaskDelay(pdMS_TO_TICKS(500));
-    
-    // テスト2: 全画面白表示
-    ESP_LOGI(TAG, "テスト2: 全画面白表示");
-    for (int y = 0; y < 64; y++) {
-        for (int x = 0; x < 128; x++) {
-            g_display->set_pixel(x, y, true);
-        }
-    }
-    g_display->display();
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    
-    // テスト3: 格子パターン表示
-    ESP_LOGI(TAG, "テスト3: 格子パターン表示");
-    g_display->clear();
-    for (int y = 0; y < 64; y += 8) {
-        g_display->draw_hline(0, y, 128, true);
-    }
-    for (int x = 0; x < 128; x += 16) {
-        g_display->draw_vline(x, 0, 64, true);
-    }
-    g_display->display();
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    
-    // テスト4: 矩形パターン表示
-    ESP_LOGI(TAG, "テスト4: 矩形パターン表示");
-    g_display->clear();
-    g_display->draw_rect(0, 0, 128, 64, true, false);      // 外枠
-    g_display->draw_rect(10, 10, 108, 44, true, false);    // 内枠
-    g_display->draw_rect(20, 20, 88, 24, true, true);      // 塗りつぶし矩形
-    g_display->display();
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    
-    // テスト5: チェッカーボードパターン表示
-    ESP_LOGI(TAG, "テスト5: チェッカーボードパターン表示");
-    g_display->clear();
-    for (int y = 0; y < 64; y++) {
-        for (int x = 0; x < 128; x++) {
-            if (((x / 8) + (y / 8)) % 2 == 0) {
-                g_display->set_pixel(x, y, true);
-            }
-        }
-    }
-    g_display->display();
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    
-    // テスト6: アニメーション（移動する点）
-    ESP_LOGI(TAG, "テスト6: アニメーション表示");
-    for (int frame = 0; frame < 100; frame++) {
-        g_display->clear();
-        
-        // 移動する点
-        int x = (frame * 2) % 128;
-        int y = 32 + (int)(16.0f * sin(frame * 0.1f));
-        g_display->set_pixel(x, y, true);
-        
-        // 移動する円（疑似円）
-        int cx = 64 + (int)(32.0f * cos(frame * 0.05f));
-        int cy = 32 + (int)(16.0f * sin(frame * 0.05f));
-        for (int i = 0; i < 8; i++) {
-            int px = cx + (int)(5.0f * cos(i * 0.785f)); // 0.785 ≈ π/4
-            int py = cy + (int)(5.0f * sin(i * 0.785f));
-            if (px >= 0 && px < 128 && py >= 0 && py < 64) {
-                g_display->set_pixel(px, py, true);
-            }
-        }
-        
-        g_display->display();
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
-    
-    // テスト7: 簡単な文字描画テスト（ビットマップ）
-    ESP_LOGI(TAG, "テスト7: 文字ビットマップ表示");
-    g_display->clear();
-    
-    // "OK" の文字パターン (8x8)
-    uint8_t char_O[8] = {
-        0b00111100,
-        0b01100110,
-        0b11000011,
-        0b11000011,
-        0b11000011,
-        0b11000011,
-        0b01100110,
-        0b00111100
-    };
-    
-    uint8_t char_K[8] = {
-        0b11000011,
-        0b11000110,
-        0b11001100,
-        0b11111000,
-        0b11111000,
-        0b11001100,
-        0b11000110,
-        0b11000011
-    };
-    
-    // "O" を描画
-    for (int y = 0; y < 8; y++) {
-        for (int x = 0; x < 8; x++) {
-            if (char_O[y] & (1 << (7 - x))) {
-                g_display->set_pixel(48 + x, 20 + y, true);
-            }
-        }
-    }
-    
-    // "K" を描画
-    for (int y = 0; y < 8; y++) {
-        for (int x = 0; x < 8; x++) {
-            if (char_K[y] & (1 << (7 - x))) {
-                g_display->set_pixel(64 + x, 20 + y, true);
-            }
-        }
-    }
-    
+    g_display->draw_rect(0, 0, 128, 64, true, false);
+    g_display->draw_bitmap(image_logo, IMAGE_DATA_WIDTH, IMAGE_DATA_HEIGHT, 0, 0, false);
     g_display->display();
     vTaskDelay(pdMS_TO_TICKS(2000));
-    
-    // 最終表示: ステータス表示
-    ESP_LOGI(TAG, "テスト8: ステータス表示");
+
+    // テスト2: ビットマップ画像表示（反転）
+    ESP_LOGI(TAG, "テスト2: ビットマップ画像表示（反転）");
     g_display->clear();
-    
-    // ステータス表示用のドット（デバイス状態を視覚的に表示）
-    g_display->set_pixel(10, 10, g_camera_ready);     // カメラ状態
-    g_display->set_pixel(20, 10, g_encoder_ready);    // エンコーダー状態
-    g_display->set_pixel(30, 10, g_display_ready);    // ディスプレイ状態（自分自身）
-    g_display->set_pixel(40, 10, g_sd_card_ready);    // SDカード状態
-    
-    // パレット番号を表示（簡単なパターンで）
-    int palette_dots = g_current_palette_index + 1;
-    for (int i = 0; i < palette_dots && i < 8; i++) {
-        g_display->set_pixel(60 + i * 4, 30, true);
-    }
-    
-    // 枠線を描画
-    g_display->draw_rect(5, 5, 118, 54, true, false);
-    
+    g_display->draw_rect(0, 0, 128, 64, true, false);
+    g_display->draw_bitmap(image_logo, IMAGE_DATA_WIDTH, IMAGE_DATA_HEIGHT, 0, 12, true);
     g_display->display();
-    
-    ESP_LOGI(TAG, "✅ SSD1306テストパターン完了 - 表示テスト成功");
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    // テスト3: 美咲フォント文字描画
+    ESP_LOGI(TAG, "テスト3: 美咲フォント文字描画");
+    g_display->clear();
+    g_display->draw_rect(0, 0, 128, 64, true, false);
+
+    // ランダムな位置にランダムな文字を表示（10文字）
+    for (int i = 0; i < 10; i++) {
+        uint16_t char_index = esp_random() % MISAKI_TOTAL_CHARS;
+        int16_t x = 1 + (esp_random() % 119);
+        int16_t y = 1 + (esp_random() % 55);
+        g_display->draw_char(char_index, x, y, true);
+    }
+
+    g_display->display();
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    // テスト4: ターミナル表示（枠線なし）
+    ESP_LOGI(TAG, "テスト4: ターミナル表示（枠線なし）");
+    Terminal terminal;
+    terminal.init();
+    terminal.set_position(0, 0);
+    terminal.set_border(false);
+
+    // いくつかの文字を配置
+    for (uint8_t row = 0; row < 8; row++) {
+        for (uint8_t col = 0; col < 16; col++) {
+            // チェッカーパターン
+            uint16_t char_index = ((row + col) % 2) ? 100 : 200;
+            terminal.set_char(row, col, char_index);
+        }
+    }
+
+    g_display->clear();
+    g_display->draw_terminal(&terminal);
+    g_display->display();
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    // テスト5: ターミナル表示（枠線あり）
+    ESP_LOGI(TAG, "テスト5: ターミナル表示（枠線あり）");
+    terminal.clear();
+    terminal.set_border(true);
+
+    // print_char()を使って文字を出力
+    for (int i = 0; i < 50; i++) {
+        uint16_t char_index = 100 + (i % 200);
+        terminal.print_char(char_index);
+    }
+
+    g_display->clear();
+    g_display->draw_terminal(&terminal);
+    g_display->display();
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    // テスト6: ターミナルスクロールテスト
+    ESP_LOGI(TAG, "テスト6: ターミナルスクロールテスト");
+    terminal.clear();
+    terminal.set_border(true);
+
+    // 1行ずつ追加してスクロールを確認
+    for (int line = 0; line < 12; line++) {
+        for (int col = 0; col < 18; col++) {
+            terminal.print_char(300 + (line * 10 + col) % 400);
+        }
+        terminal.newline();
+
+        g_display->clear();
+        g_display->draw_terminal(&terminal);
+        g_display->display();
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    ESP_LOGI(TAG, "✅ ディスプレイ描画テスト完了");
 }
 
 // ボタン処理関数群（省略、元のファイルと同じ）

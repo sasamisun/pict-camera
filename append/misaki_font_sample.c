@@ -18,19 +18,20 @@ uint16_t misaki_get_char_count(void) {
     return MISAKI_TOTAL_CHARS;
 }
 
-                // SSD1306への文字描画サンプル関数
+// SSD1306への文字描画サンプル関数
 void draw_misaki_char(int x, int y, uint16_t char_index) {
     const misaki_char_t* char_data = misaki_get_char(char_index);
     if (char_data == NULL) return;
 
-    // 8x8ドットを描画（上の行から順に処理）
+    // 8x8ドットを描画（配列は右から左の列順）
     for (int col = 0; col < 8; col++) {
+        // 配列のインデックスは右から左（7-col）
         uint8_t column_data = char_data->bitmap[col];
+        int actual_col = 7 - col;  // 実際の列位置
         for (int row = 0; row < 8; row++) {
-            // 上の行（row=0）が最上位ビット（bit7）
-            if (column_data & (1 << (7 - row))) {
+            if (column_data & (1 << row)) {
                 // SSD1306のピクセル描画関数を呼び出し
-                // ssd1306_draw_pixel(x + col, y + row, 1);
+                // ssd1306_draw_pixel(x + actual_col, y + row, 1);
             }
         }
     }

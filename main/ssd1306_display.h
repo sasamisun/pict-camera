@@ -13,6 +13,9 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include <string.h>
+#include "misaki_font.h"
+#include "image_logo.h"
+#include "terminal.h"
 
 // SSD1306 デフォルト設定
 #define SSD1306_DEFAULT_ADDR            0x3C    // デフォルトI2Cアドレス
@@ -111,6 +114,33 @@ public:
      */
     void set_pixel(int16_t x, int16_t y, bool white);
     
+    /**
+     * @brief 美咲フォント文字を描画（8x8ドット）
+     * @param char_index 文字配列番号 (0-751)
+     * @param x 開始X座標
+     * @param y 開始Y座標
+     * @param white true: 白文字, false: 黒文字
+     */
+    void draw_char(uint16_t char_index, int16_t x, int16_t y, bool white = true);
+
+    /**
+     * @brief ビットマップ画像を描画（2値画像）
+     * @param bitmap 画像データ配列へのポインタ（1バイト=8ピクセル、水平方向ビット詰め）
+     * @param width 画像の幅（ピクセル）
+     * @param height 画像の高さ（ピクセル）
+     * @param x 表示開始X座標
+     * @param y 表示開始Y座標
+     * @param invert true: 白黒反転, false: 通常表示
+     */
+    void draw_bitmap(const uint8_t* bitmap, uint16_t width, uint16_t height,
+                     int16_t x, int16_t y, bool invert = false);
+
+    /**
+     * @brief ターミナルを描画
+     * @param terminal ターミナルオブジェクトへのポインタ
+     */
+    void draw_terminal(const Terminal* terminal);
+
     /**
      * @brief 文字列を描画（シンプルな6x8フォント）
      * @param x 開始X座標

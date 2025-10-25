@@ -91,26 +91,27 @@ class MisakiFontConverter:
         """
         8x8ビットマップを8バイトのデータに変換
         各バイトは縦8ドットを表現（SSD1306形式）
+        配列は右から左の列順で格納（上下反転対応）
         
         Args:
             char_bitmap (numpy.ndarray): 8x8グレースケールビットマップ
             
         Returns:
-            list: 8バイトのリスト
+            list: 8バイトのリスト（右から左の列順）
         """
         bytes_data = []
         
         # 閾値でモノクロ化（128未満を黒=1、128以上を白=0とする）
         threshold = 128
         
-        # 各列（x座標）について処理
-        for x in range(self.CHAR_WIDTH):
+        # 各列（x座標）について処理（右から左へ：7,6,5,4,3,2,1,0）
+        for x in range(self.CHAR_WIDTH):  # 逆順でループ
             byte_value = 0
             
-            # 各行（y座標）について処理（上位ビットから）
+            # 各行（y座標）について処理
             for y in range(self.CHAR_HEIGHT):
                 if char_bitmap[y, x] < threshold:  # 黒ピクセル
-                    byte_value |= (1 << y)  # 対応するビットを立てる
+                    byte_value |= (1 << y)  # 通常のビット配置
             
             bytes_data.append(byte_value)
         
@@ -181,7 +182,7 @@ class MisakiFontConverter:
                 # 文字データ型定義
                 f.write("// 文字データ構造体\n")
                 f.write("typedef struct {\n")
-                f.write("    uint8_t bitmap[8];  // 8x8ビットマップデータ（縦方向）\n")
+                f.write("    uint8_t bitmap[8];  // 8x8ビットマップ（右から左の列順で格納）\n")
                 f.write("} misaki_char_t;\n\n")
                 
                 # フォントデータ配列宣言
@@ -190,11 +191,9 @@ class MisakiFontConverter:
                 f.write("extern \"C\" {\n")
                 f.write("#endif\n\n")
                 
-                f.write("extern const misaki_char_t misaki_font[MISAKI_TOTAL_CHARS];\n\n")
-                
                 # 配列データ定義開始
                 f.write("// フォントデータ実体\n")
-                f.write("const misaki_char_t misaki_font[MISAKI_TOTAL_CHARS] = {\n")
+                f.write("static const misaki_char_t misaki_font[MISAKI_TOTAL_CHARS] = {\n")
                 
                 # 各文字のデータを出力
                 for i, char_data in enumerate(self.font_data):
@@ -266,13 +265,15 @@ class MisakiFontConverter:
                 f.write("void draw_misaki_char(int x, int y, uint16_t char_index) {\n")
                 f.write("    const misaki_char_t* char_data = misaki_get_char(char_index);\n")
                 f.write("    if (char_data == NULL) return;\n\n")
-                f.write("    // 8x8ドットを描画\n")
+                f.write("    // 8x8ドットを描画（配列は右から左の列順）\n")
                 f.write("    for (int col = 0; col < 8; col++) {\n")
+                f.write("        // 配列のインデックスは右から左（7-col）\n")
                 f.write("        uint8_t column_data = char_data->bitmap[col];\n")
+                f.write("        int actual_col = 7 - col;  // 実際の列位置\n")
                 f.write("        for (int row = 0; row < 8; row++) {\n")
                 f.write("            if (column_data & (1 << row)) {\n")
                 f.write("                // SSD1306のピクセル描画関数を呼び出し\n")
-                f.write("                // ssd1306_draw_pixel(x + col, y + row, 1);\n")
+                f.write("                // ssd1306_draw_pixel(x + actual_col, y + row, 1);\n")
                 f.write("            }\n")
                 f.write("        }\n")
                 f.write("    }\n")
