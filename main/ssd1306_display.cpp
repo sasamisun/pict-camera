@@ -8,6 +8,84 @@
 
 static const char* TAG = "SSD1306Display";
 
+// UTF-8 → 美咲フォントインデックス変換テーブル（記号用）
+static const struct {
+    uint32_t codepoint;
+    uint16_t index;
+} symbol_table[] = {
+    {0x0020, 0},    // ' ' (スペース)
+    {0x3001, 1},    // 、
+    {0x3002, 2},    // 。
+    {0x002C, 3},    // ,
+    {0x002E, 4},    // .
+    {0x30FB, 5},    // ・
+    {0x003A, 6},    // :
+    {0x003B, 7},    // ;
+    {0x003F, 8},    // ?
+    {0x0021, 9},    // !
+    {0x309B, 10},   // ゛
+    {0x309C, 11},   // ゜
+    {0x0060, 12},   // `
+    {0x0027, 13},   // '
+    {0x00A8, 14},   // ¨
+    {0x005E, 15},   // ^
+    {0x00AF, 16},   // ¯
+    {0x005F, 17},   // _
+    {0x30FD, 18},   // ヽ
+    {0x30FE, 19},   // ヾ
+    {0x309D, 20},   // ゝ
+    {0x309E, 21},   // ゞ
+    {0x3003, 22},   // 〃
+    {0x4EDD, 23},   // 仝
+    {0x3005, 24},   // 々
+    {0x3006, 25},   // 〆
+    {0x25CB, 26},   // ○
+    {0x30FC, 27},   // ー
+    {0x2015, 28},   // ―
+    {0x002D, 29},   // -
+    {0x002F, 30},   // /
+    {0x005C, 31},   // '\'
+    {0x007E, 32},   // ~
+    {0x2016, 33},   // ‖
+    {0x007C, 34},   // |
+    {0x2026, 35},   // …
+    {0x2025, 36},   // ‥
+    {0x0028, 41},   // (
+    {0x0029, 42},   // )
+    {0x3014, 43},   // 〔
+    {0x3015, 44},   // 〕
+    {0x005B, 45},   // [
+    {0x005D, 46},   // ]
+    {0x007B, 47},   // {
+    {0x007D, 48},   // }
+    {0x003C, 49},   // <
+    {0x003E, 50},   // >
+    {0x300A, 51},   // 《
+    {0x300B, 52},   // 》
+    {0x300C, 53},   // 「
+    {0x300D, 54},   // 」
+    {0x300E, 55},   // 『
+    {0x300F, 56},   // 』
+    {0x3010, 57},   // 【
+    {0x3011, 58},   // 】
+    {0x002B, 59},   // +
+    {0x00B1, 61},   // ±
+    {0x00D7, 62},   // ×
+    {0x00F7, 63},   // ÷
+    {0x003D, 65},   // = (半角)
+    {0x2260, 66},   // ≠
+    {0x2266, 68},   // ≦
+    {0x2267, 69},   // ≧
+    {0x0022, 76},   // "
+    {0xFFE5, 78},   // ￥
+    {0x0024, 79},   // $
+    {0x0025, 82},   // %
+    {0x0023, 83},   // #
+    {0x0026, 84},   // &
+    {0x002A, 85},   // *
+    {0x0040, 86},   // @
+};
+
 SSD1306Display::SSD1306Display(i2c_port_t i2c_port, uint8_t device_addr)
     : _i2c_port(i2c_port)
     , _device_address(device_addr)
@@ -410,4 +488,139 @@ void SSD1306Display::get_screen_size(int* width, int* height) const
 {
     if (width) *width = SSD1306_WIDTH;
     if (height) *height = SSD1306_HEIGHT;
+}
+
+// ========== UTF-8文字列処理 ==========
+
+uint32_t SSD1306Display::decode_utf8(const char* utf8_str, int* bytes_consumed)
+{
+    if (!utf8_str || !bytes_consumed) {
+        if (bytes_consumed) *bytes_consumed = 0;
+        return 0;
+    }
+
+    uint8_t byte1 = (uint8_t)utf8_str[0];
+
+    // 1バイト文字 (ASCII: 0x00-0x7F)
+    if ((byte1 & 0x80) == 0) {
+        *bytes_consumed = 1;
+        return byte1;
+    }
+
+    // 2バイト文字 (0xC0-0xDF)
+    if ((byte1 & 0xE0) == 0xC0) {
+        uint8_t byte2 = (uint8_t)utf8_str[1];
+        if ((byte2 & 0xC0) == 0x80) {
+            *bytes_consumed = 2;
+            return ((byte1 & 0x1F) << 6) | (byte2 & 0x3F);
+        }
+    }
+
+    // 3バイト文字 (0xE0-0xEF)
+    if ((byte1 & 0xF0) == 0xE0) {
+        uint8_t byte2 = (uint8_t)utf8_str[1];
+        uint8_t byte3 = (uint8_t)utf8_str[2];
+        if ((byte2 & 0xC0) == 0x80 && (byte3 & 0xC0) == 0x80) {
+            *bytes_consumed = 3;
+            return ((byte1 & 0x0F) << 12) | ((byte2 & 0x3F) << 6) | (byte3 & 0x3F);
+        }
+    }
+
+    // 4バイト文字 (0xF0-0xF7)
+    if ((byte1 & 0xF8) == 0xF0) {
+        uint8_t byte2 = (uint8_t)utf8_str[1];
+        uint8_t byte3 = (uint8_t)utf8_str[2];
+        uint8_t byte4 = (uint8_t)utf8_str[3];
+        if ((byte2 & 0xC0) == 0x80 && (byte3 & 0xC0) == 0x80 && (byte4 & 0xC0) == 0x80) {
+            *bytes_consumed = 4;
+            return ((byte1 & 0x07) << 18) | ((byte2 & 0x3F) << 12) |
+                   ((byte3 & 0x3F) << 6) | (byte4 & 0x3F);
+        }
+    }
+
+    // 不正なUTF-8シーケンス
+    *bytes_consumed = 1;
+    return 0xFFFD; // Unicode replacement character
+}
+
+uint16_t SSD1306Display::lookup_symbol(uint32_t codepoint)
+{
+    // 線形探索（テーブルサイズが小さいため）
+    for (size_t i = 0; i < sizeof(symbol_table) / sizeof(symbol_table[0]); i++) {
+        if (symbol_table[i].codepoint == codepoint) {
+            return symbol_table[i].index;
+        }
+    }
+    return 0xFFFF; // 見つからない
+}
+
+uint16_t SSD1306Display::utf8_to_font_index(const char* utf8_str, int* bytes_consumed)
+{
+    // UTF-8デコード
+    uint32_t codepoint = decode_utf8(utf8_str, bytes_consumed);
+
+    // 数字 '0'-'9' (U+0030-0039) → インデックス203-212
+    if (codepoint >= 0x0030 && codepoint <= 0x0039) {
+        return 203 + (codepoint - 0x0030);
+    }
+
+    // 大文字 'A'-'Z' (U+0041-005A) → インデックス220-245
+    if (codepoint >= 0x0041 && codepoint <= 0x005A) {
+        return 220 + (codepoint - 0x0041);
+    }
+
+    // 小文字 'a'-'z' (U+0061-007A) → インデックス252-277
+    if (codepoint >= 0x0061 && codepoint <= 0x007A) {
+        return 252 + (codepoint - 0x0061);
+    }
+
+    // ひらがな 'ぁ'-'ん' (U+3041-3093) → インデックス282-364
+    if (codepoint >= 0x3041 && codepoint <= 0x3093) {
+        return 282 + (codepoint - 0x3041);
+    }
+
+    // カタカナ 'ァ'-'ヴ' (U+30A1-30F4) → インデックス376-459
+    if (codepoint >= 0x30A1 && codepoint <= 0x30F4) {
+        return 376 + (codepoint - 0x30A1);
+    }
+
+    // 記号テーブルで検索
+    uint16_t idx = lookup_symbol(codepoint);
+    if (idx != 0xFFFF) {
+        return idx;
+    }
+
+    // 未対応文字 → インデックス73 (□記号)
+    ESP_LOGD(TAG, "未対応文字: U+%04lX", (unsigned long)codepoint);
+    return 115;
+}
+
+void SSD1306Display::terminal_print(Terminal* terminal, const char* str)
+{
+    if (!terminal || !str) {
+        ESP_LOGW(TAG, "terminal_print: 無効な引数");
+        return;
+    }
+
+    const char* ptr = str;
+    while (*ptr != '\0') {
+        int bytes_consumed = 0;
+        uint16_t font_index = utf8_to_font_index(ptr, &bytes_consumed);
+
+        if (bytes_consumed > 0) {
+            terminal->print_char(font_index);
+            ptr += bytes_consumed;
+        } else {
+            // 不正なシーケンスをスキップ
+            ptr++;
+        }
+    }
+}
+
+void SSD1306Display::terminal_println(Terminal* terminal, const char* str)
+{
+    terminal_print(terminal, str);
+    if (terminal) {
+        terminal->newline();
+    }
 }

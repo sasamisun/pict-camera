@@ -70,6 +70,11 @@ private:
     esp_err_t write_data(const uint8_t* data, size_t count);
     void set_pixel_in_buffer(int16_t x, int16_t y, bool white);
 
+    // UTF-8変換ヘルパーメソッド
+    uint32_t decode_utf8(const char* utf8_str, int* bytes_consumed);
+    uint16_t utf8_to_font_index(const char* utf8_str, int* bytes_consumed);
+    uint16_t lookup_symbol(uint32_t codepoint);
+
 public:
     /**
      * @brief コンストラクタ
@@ -140,6 +145,20 @@ public:
      * @param terminal ターミナルオブジェクトへのポインタ
      */
     void draw_terminal(const Terminal* terminal);
+
+    /**
+     * @brief ターミナルに文字列を出力（UTF-8対応）
+     * @param terminal ターミナルオブジェクトへのポインタ
+     * @param str UTF-8文字列
+     */
+    void terminal_print(Terminal* terminal, const char* str);
+
+    /**
+     * @brief ターミナルに文字列を出力して改行（UTF-8対応）
+     * @param terminal ターミナルオブジェクトへのポインタ
+     * @param str UTF-8文字列
+     */
+    void terminal_println(Terminal* terminal, const char* str);
 
     /**
      * @brief 文字列を描画（シンプルな6x8フォント）

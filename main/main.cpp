@@ -189,25 +189,41 @@ void run_display_test_patterns(void);
 void run_display_test_patterns(void)
 {
     if (!g_display_ready || g_display == nullptr) {
-        ESP_LOGE(TAG, "❌ ディスプレイが準備できていません");
         return;
     }
 
-    ESP_LOGI(TAG, "🎨 スプラッシュ画面＋ターミナル");
-
-    ESP_LOGI(TAG, "ビットマップ画像表示（通常）");
     g_display->clear();
     g_display->draw_bitmap(image_logo, IMAGE_DATA_WIDTH, IMAGE_DATA_HEIGHT, 0, 0, false);
     g_display->display();
 
     // 画像の下にターミナル表示
-    ESP_LOGI(TAG, "画像の下にターミナル表示（枠線なし）");
     Terminal terminal;
     terminal.init();
     terminal.set_position(0, 40);
     terminal.set_border(false);
 
-    // todo: ここでターミナルにメッセージを表示するコードを追加
+    // UTF-8文字列をターミナルに表示
+    g_display->terminal_println(&terminal, "PICT Camera v1.0");
+    g_display->terminal_println(&terminal, "System Init...");
+
+    g_display->draw_terminal(&terminal);
+    g_display->display();
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    // テスト: 日本語文字列
+    terminal.clear();
+    terminal.set_border(true);
+    terminal.set_position(0, 0);
+
+    g_display->clear();
+    g_display->terminal_println(&terminal, "こんにちは!");
+    g_display->terminal_println(&terminal, "カメラ準備OK");
+    g_display->terminal_println(&terminal, "ABC:123");
+    g_display->terminal_println(&terminal, "記号?!@#$%");
+
+    g_display->draw_terminal(&terminal);
+    g_display->display();
+    vTaskDelay(pdMS_TO_TICKS(3000));
 
 }
 
