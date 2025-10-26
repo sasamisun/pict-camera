@@ -81,6 +81,10 @@ static const char *TAG = "PixelArtCamera";
 #define PROCESS_TASK_STACK 16384
 #define ENCODER_TASK_STACK 4096
 
+// エンコーダーチャタリング対策設定
+#define ENCODER_DEBOUNCE_MS 200      // 値変化後のデバウンス時間(ms)
+#define ENCODER_POLL_INTERVAL_MS 50  // ポーリング間隔(ms)
+
 // 構造体定義など... (省略、元のファイルと同じ)
 typedef struct
 {
@@ -552,13 +556,15 @@ void process_button_events(void)
     }
 }
 
-// ★★★ 修正されたエンコーダータスク ★★★
+// ★★★ チャタリング対策を追加したエンコーダータスク ★★★
 void encoder_task(void *parameter)
 {
-    ESP_LOGI(TAG, "🔄 エンコーダータスク開始");
+    ESP_LOGI(TAG, "🔄 エンコーダータスク開始（デバウンス: %dms, ポーリング: %dms）",
+             ENCODER_DEBOUNCE_MS, ENCODER_POLL_INTERVAL_MS);
 
     int16_t last_encoder_value = 0;
     uint32_t last_update_time = 0;
+    uint32_t last_change_time = 0;  // チャタリング対策用: 最後に値が変化した時刻
 
     while (1)
     {
@@ -573,80 +579,96 @@ void encoder_task(void *parameter)
             if (current_value < 0)
                 current_value += MAX_PALETTE_INDEX;
 
+            // チャタリング対策: デバウンス時間をチェック
+            uint32_t time_since_last_change = current_time - last_change_time;
+
             // 値が変化した場合の処理
             if (current_value != last_encoder_value)
             {
-                int16_t delta = current_value - last_encoder_value;
-
-                ESP_LOGI(TAG, "🔄 エンコーダー値変更: %d → %d (Δ%d)",
-                         last_encoder_value, current_value, delta);
-
-                // パレットインデックスを更新
-                g_current_palette_index = current_value;
-
-                // LEDの色を変更（新APIを使用）
-                uint32_t color = PALETTE_REP_COLORS[current_value];
-                uint8_t r = (color >> 16) & 0xFF;
-                uint8_t g = (color >> 8) & 0xFF;
-                uint8_t b = color & 0xFF;
-
-                esp_err_t led_result = pimoroni_encoder_set_led(&g_encoder, r, g, b);
-
-                if (led_result == ESP_OK)
+                // デバウンス時間が経過している場合のみ処理
+                if (time_since_last_change >= ENCODER_DEBOUNCE_MS)
                 {
-                    ESP_LOGI(TAG, "🎨 LED色変更成功: パレット%d → RGB(%d,%d,%d)",
-                             current_value, r, g, b);
+                    int16_t delta = current_value - last_encoder_value;
+
+                    // 最後の変化時刻を更新
+                    last_change_time = current_time;
+
+                    ESP_LOGI(TAG, "🔄 エンコーダー値変更: %d → %d (Δ%d)",
+                             last_encoder_value, current_value, delta);
+
+                    // パレットインデックスを更新
+                    g_current_palette_index = current_value;
+
+                    // LEDの色を変更（新APIを使用）
+                    uint32_t color = PALETTE_REP_COLORS[current_value];
+                    uint8_t r = (color >> 16) & 0xFF;
+                    uint8_t g = (color >> 8) & 0xFF;
+                    uint8_t b = color & 0xFF;
+
+                    esp_err_t led_result = pimoroni_encoder_set_led(&g_encoder, r, g, b);
+
+                    if (led_result == ESP_OK)
+                    {
+                        ESP_LOGI(TAG, "🎨 LED色変更成功: パレット%d → RGB(%d,%d,%d)",
+                                 current_value, r, g, b);
+                    }
+                    else
+                    {
+                        ESP_LOGW(TAG, "LED色変更失敗: %s", esp_err_to_name(led_result));
+                    }
+
+                    // ディスプレイを更新（簡単なステータス表示）
+                    if (g_display_ready && (current_time - last_update_time) > 100)
+                    {
+                        g_display->clear();
+
+                        // パレット番号を表示（簡単なパターンで）
+                        int palette_dots = current_value + 1;
+                        for (int i = 0; i < palette_dots && i < 8; i++)
+                        {
+                            g_display->set_pixel(10 + i * 8, 10, true);
+                        }
+
+                        // RGB値を簡単なバーで表示
+                        for (int i = 0; i < r / 8 && i < 32; i++)
+                        {
+                            g_display->set_pixel(10 + i, 25, true); // R
+                        }
+                        for (int i = 0; i < g / 8 && i < 32; i++)
+                        {
+                            g_display->set_pixel(10 + i, 35, true); // G
+                        }
+                        for (int i = 0; i < b / 8 && i < 32; i++)
+                        {
+                            g_display->set_pixel(10 + i, 45, true); // B
+                        }
+
+                        g_display->display();
+                        last_update_time = current_time;
+                    }
+
+                    // エンコーダーイベントをキューに送信
+                    if (g_encoder_event_queue != NULL)
+                    {
+                        encoder_event_t event = {
+                            .value = current_value,
+                            .delta = delta,
+                            .timestamp = current_time};
+
+                        if (xQueueSend(g_encoder_event_queue, &event, 0) != pdTRUE)
+                        {
+                            ESP_LOGW(TAG, "エンコーダーイベントキュー満杯");
+                        }
+                    }
+
+                    last_encoder_value = current_value;
                 }
                 else
                 {
-                    ESP_LOGW(TAG, "LED色変更失敗: %s", esp_err_to_name(led_result));
+                    // デバウンス時間内の変化は無視（デバッグログ出力）
+                    ESP_LOGD(TAG, "エンコーダー値変化を無視（デバウンス中: %ldms経過）",
+                             time_since_last_change);
                 }
-
-                // ディスプレイを更新（簡単なステータス表示）
-                if (g_display_ready && (current_time - last_update_time) > 100)
-                {
-                    g_display->clear();
-
-                    // パレット番号を表示（簡単なパターンで）
-                    int palette_dots = current_value + 1;
-                    for (int i = 0; i < palette_dots && i < 8; i++)
-                    {
-                        g_display->set_pixel(10 + i * 8, 10, true);
-                    }
-
-                    // RGB値を簡単なバーで表示
-                    for (int i = 0; i < r / 8 && i < 32; i++)
-                    {
-                        g_display->set_pixel(10 + i, 25, true); // R
-                    }
-                    for (int i = 0; i < g / 8 && i < 32; i++)
-                    {
-                        g_display->set_pixel(10 + i, 35, true); // G
-                    }
-                    for (int i = 0; i < b / 8 && i < 32; i++)
-                    {
-                        g_display->set_pixel(10 + i, 45, true); // B
-                    }
-
-                    g_display->display();
-                    last_update_time = current_time;
-                }
-
-                // エンコーダーイベントをキューに送信
-                if (g_encoder_event_queue != NULL)
-                {
-                    encoder_event_t event = {
-                        .value = current_value,
-                        .delta = delta,
-                        .timestamp = current_time};
-
-                    if (xQueueSend(g_encoder_event_queue, &event, 0) != pdTRUE)
-                    {
-                        ESP_LOGW(TAG, "エンコーダーイベントキュー満杯");
-                    }
-                }
-
-                last_encoder_value = current_value;
             }
         }
         else
@@ -654,7 +676,8 @@ void encoder_task(void *parameter)
             vTaskDelay(pdMS_TO_TICKS(500));
         }
 
-        vTaskDelay(pdMS_TO_TICKS(10));
+        // ポーリング間隔を延長してノイズを低減
+        vTaskDelay(pdMS_TO_TICKS(ENCODER_POLL_INTERVAL_MS));
     }
 }
 
