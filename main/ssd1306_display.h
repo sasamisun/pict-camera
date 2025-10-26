@@ -161,6 +161,15 @@ public:
     void terminal_println(Terminal* terminal, const char* str);
 
     /**
+     * @brief ターミナルの指定行に文字列を上書き表示（UTF-8対応）
+     * @param terminal ターミナルオブジェクトへのポインタ
+     * @param row 対象行番号（0-7）
+     * @param str UTF-8文字列
+     * @param col_offset 描画開始位置のオフセット（文字数、デフォルト0）
+     */
+    void terminal_print_at(Terminal* terminal, uint8_t row, const char* str, uint8_t col_offset = 0);
+
+    /**
      * @brief 文字列を描画（シンプルな6x8フォント）
      * @param x 開始X座標
      * @param y 開始Y座標

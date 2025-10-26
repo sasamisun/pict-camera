@@ -22,8 +22,10 @@
  */
 class Terminal {
 private:
-    // バッファ（16列 × 8行固定）
-    uint16_t char_buffer[TERMINAL_ROWS][TERMINAL_COLS];
+    // バッファ（動的サイズ対応）
+    uint16_t** char_buffer;
+    uint8_t cols;  // 列数
+    uint8_t rows;  // 行数
 
     // カーソル管理
     uint8_t cursor_row;
@@ -42,8 +44,10 @@ private:
 public:
     /**
      * @brief コンストラクタ
+     * @param cols 列数（デフォルト: TERMINAL_COLS = 16）
+     * @param rows 行数（デフォルト: TERMINAL_ROWS = 8）
      */
-    Terminal();
+    Terminal(uint8_t cols = TERMINAL_COLS, uint8_t rows = TERMINAL_ROWS);
 
     /**
      * @brief デストラクタ
@@ -92,15 +96,15 @@ public:
 
     /**
      * @brief 行数を取得
-     * @return 行数（8固定）
+     * @return 行数
      */
-    uint8_t get_rows() const { return TERMINAL_ROWS; }
+    uint8_t get_rows() const { return rows; }
 
     /**
      * @brief 列数を取得
-     * @return 列数（16固定）
+     * @return 列数
      */
-    uint8_t get_cols() const { return TERMINAL_COLS; }
+    uint8_t get_cols() const { return cols; }
 
     /**
      * @brief 表示X座標を取得
@@ -159,6 +163,12 @@ public:
      * @param col 列番号を格納するポインタ
      */
     void get_cursor(uint8_t* row, uint8_t* col) const;
+
+    /**
+     * @brief カーソル行番号を取得
+     * @return 現在のカーソル行（0-7）
+     */
+    uint8_t get_cursor_row() const;
 
     // ========== ターミナル操作 ==========
 

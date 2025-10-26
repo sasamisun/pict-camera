@@ -8,8 +8,11 @@
 
 static const char* TAG = "Terminal";
 
-Terminal::Terminal()
-    : cursor_row(0)
+Terminal::Terminal(uint8_t cols, uint8_t rows)
+    : char_buffer(nullptr)
+    , cols(cols)
+    , rows(rows)
+    , cursor_row(0)
     , cursor_col(0)
     , display_x(0)
     , display_y(0)
@@ -18,19 +21,34 @@ Terminal::Terminal()
     , auto_wrap(true)
     , auto_scroll(true)
 {
+    // 動的バッファ確保
+    char_buffer = new uint16_t*[rows];
+    for (uint8_t i = 0; i < rows; i++) {
+        char_buffer[i] = new uint16_t[cols];
+    }
+
+    ESP_LOGI(TAG, "ターミナル作成: %d列 × %d行", cols, rows);
     init();
 }
 
 Terminal::~Terminal()
 {
-    // 静的バッファなので特に解放処理は不要
+    // 動的バッファ解放
+    if (char_buffer) {
+        for (uint8_t i = 0; i < rows; i++) {
+            delete[] char_buffer[i];
+        }
+        delete[] char_buffer;
+        char_buffer = nullptr;
+    }
+    ESP_LOGI(TAG, "ターミナル破棄");
 }
 
 void Terminal::init()
 {
     // バッファを空白文字で初期化
-    for (uint8_t row = 0; row < TERMINAL_ROWS; row++) {
-        for (uint8_t col = 0; col < TERMINAL_COLS; col++) {
+    for (uint8_t row = 0; row < rows; row++) {
+        for (uint8_t col = 0; col < cols; col++) {
             char_buffer[row][col] = TERMINAL_CHAR_EMPTY;
         }
     }
@@ -39,7 +57,7 @@ void Terminal::init()
     cursor_row = 0;
     cursor_col = 0;
 
-    ESP_LOGI(TAG, "ターミナル初期化完了: %d行 × %d列", TERMINAL_ROWS, TERMINAL_COLS);
+    ESP_LOGI(TAG, "ターミナル初期化完了: %d行 × %d列", rows, cols);
 }
 
 // ========== セッター ==========
@@ -74,7 +92,7 @@ void Terminal::set_auto_scroll(bool scroll)
 
 void Terminal::set_char(uint8_t row, uint8_t col, uint16_t char_index)
 {
-    if (row >= TERMINAL_ROWS || col >= TERMINAL_COLS) {
+    if (row >= rows || col >= cols) {
         ESP_LOGW(TAG, "set_char: 範囲外 (%d, %d)", row, col);
         return;
     }
@@ -84,7 +102,7 @@ void Terminal::set_char(uint8_t row, uint8_t col, uint16_t char_index)
 
 uint16_t Terminal::get_char(uint8_t row, uint8_t col) const
 {
-    if (row >= TERMINAL_ROWS || col >= TERMINAL_COLS) {
+    if (row >= rows || col >= cols) {
         ESP_LOGW(TAG, "get_char: 範囲外 (%d, %d)", row, col);
         return TERMINAL_CHAR_EMPTY;
     }
@@ -96,8 +114,8 @@ uint16_t Terminal::get_char(uint8_t row, uint8_t col) const
 
 void Terminal::set_cursor(uint8_t row, uint8_t col)
 {
-    if (row >= TERMINAL_ROWS) row = TERMINAL_ROWS - 1;
-    if (col >= TERMINAL_COLS) col = TERMINAL_COLS - 1;
+    if (row >= rows) row = rows - 1;
+    if (col >= cols) col = cols - 1;
 
     cursor_row = row;
     cursor_col = col;
@@ -109,11 +127,16 @@ void Terminal::get_cursor(uint8_t* row, uint8_t* col) const
     if (col) *col = cursor_col;
 }
 
+uint8_t Terminal::get_cursor_row() const
+{
+    return cursor_row;
+}
+
 // ========== ターミナル操作 ==========
 
 void Terminal::clear()
 {
-    for (uint8_t row = 0; row < TERMINAL_ROWS; row++) {
+    for (uint8_t row = 0; row < rows; row++) {
         clear_line(row);
     }
 
@@ -125,12 +148,12 @@ void Terminal::clear()
 
 void Terminal::clear_line(uint8_t row)
 {
-    if (row >= TERMINAL_ROWS) {
+    if (row >= rows) {
         ESP_LOGW(TAG, "clear_line: 範囲外 (行%d)", row);
         return;
     }
 
-    for (uint8_t col = 0; col < TERMINAL_COLS; col++) {
+    for (uint8_t col = 0; col < cols; col++) {
         char_buffer[row][col] = TERMINAL_CHAR_EMPTY;
     }
 }
@@ -143,27 +166,27 @@ void Terminal::print_char(uint16_t char_index)
     // カーソルを進める
     cursor_col++;
 
-    // 行末に達した場合
-    if (cursor_col >= TERMINAL_COLS) {
+    // 行末を超えた場合（17文字目以降）
+    if (cursor_col > cols) {
         if (auto_wrap) {
             // 自動改行
             cursor_col = 0;
             cursor_row++;
 
             // 最終行を超えた場合
-            if (cursor_row >= TERMINAL_ROWS) {
+            if (cursor_row >= rows) {
                 if (auto_scroll) {
                     // 自動スクロール
                     scroll_up();
-                    cursor_row = TERMINAL_ROWS - 1;
+                    cursor_row = rows - 1;
                 } else {
                     // スクロールしない場合は最終行に留まる
-                    cursor_row = TERMINAL_ROWS - 1;
+                    cursor_row = rows - 1;
                 }
             }
         } else {
             // 自動改行しない場合は行末に留まる
-            cursor_col = TERMINAL_COLS - 1;
+            cursor_col = cols - 1;
         }
     }
 }
@@ -174,12 +197,12 @@ void Terminal::newline()
     cursor_row++;
 
     // 最終行を超えた場合
-    if (cursor_row >= TERMINAL_ROWS) {
+    if (cursor_row >= rows) {
         if (auto_scroll) {
             scroll_up();
-            cursor_row = TERMINAL_ROWS - 1;
+            cursor_row = rows - 1;
         } else {
-            cursor_row = TERMINAL_ROWS - 1;
+            cursor_row = rows - 1;
         }
     }
 }
@@ -187,14 +210,14 @@ void Terminal::newline()
 void Terminal::scroll_up()
 {
     // 全行を1行ずつ上にシフト
-    for (uint8_t row = 0; row < TERMINAL_ROWS - 1; row++) {
-        for (uint8_t col = 0; col < TERMINAL_COLS; col++) {
+    for (uint8_t row = 0; row < rows - 1; row++) {
+        for (uint8_t col = 0; col < cols; col++) {
             char_buffer[row][col] = char_buffer[row + 1][col];
         }
     }
 
     // 最終行をクリア
-    clear_line(TERMINAL_ROWS - 1);
+    clear_line(rows - 1);
 
     ESP_LOGD(TAG, "スクロールアップ");
 }
@@ -203,7 +226,7 @@ void Terminal::scroll_up()
 
 const uint16_t* Terminal::get_buffer_row(uint8_t row) const
 {
-    if (row >= TERMINAL_ROWS) {
+    if (row >= rows) {
         ESP_LOGW(TAG, "get_buffer_row: 範囲外 (行%d)", row);
         return nullptr;
     }

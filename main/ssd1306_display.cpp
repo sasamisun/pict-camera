@@ -380,14 +380,16 @@ void SSD1306Display::draw_terminal(const Terminal* terminal)
     int16_t base_y = terminal->get_display_y();
     bool invert = terminal->get_invert();
     bool show_border = terminal->get_show_border();
+    uint8_t cols = terminal->get_cols();
+    uint8_t rows = terminal->get_rows();
 
-    ESP_LOGD(TAG, "ターミナル描画: 位置=(%d,%d), 反転=%s, 枠線=%s",
-             base_x, base_y, invert ? "ON" : "OFF", show_border ? "ON" : "OFF");
+    ESP_LOGD(TAG, "ターミナル描画: 位置=(%d,%d), サイズ=%dx%d, 反転=%s, 枠線=%s",
+             base_x, base_y, cols, rows, invert ? "ON" : "OFF", show_border ? "ON" : "OFF");
 
     // 枠線を描画
     if (show_border) {
-        int16_t border_width = TERMINAL_COLS * MISAKI_CHAR_WIDTH + 2;
-        int16_t border_height = TERMINAL_ROWS * MISAKI_CHAR_HEIGHT + 2;
+        int16_t border_width = cols * MISAKI_CHAR_WIDTH + 2;
+        int16_t border_height = rows * MISAKI_CHAR_HEIGHT + 2;
         draw_rect(base_x, base_y, border_width, border_height, !invert, false);
 
         // 枠線分オフセット
@@ -396,11 +398,11 @@ void SSD1306Display::draw_terminal(const Terminal* terminal)
     }
 
     // 各文字を描画
-    for (uint8_t row = 0; row < TERMINAL_ROWS; row++) {
+    for (uint8_t row = 0; row < rows; row++) {
         const uint16_t* row_buffer = terminal->get_buffer_row(row);
         if (!row_buffer) continue;
 
-        for (uint8_t col = 0; col < TERMINAL_COLS; col++) {
+        for (uint8_t col = 0; col < cols; col++) {
             uint16_t char_index = row_buffer[col];
 
             // 文字位置を計算
@@ -622,5 +624,39 @@ void SSD1306Display::terminal_println(Terminal* terminal, const char* str)
     terminal_print(terminal, str);
     if (terminal) {
         terminal->newline();
+    }
+}
+
+void SSD1306Display::terminal_print_at(Terminal* terminal, uint8_t row,
+                                        const char* str, uint8_t col_offset)
+{
+    if (!terminal || !str) {
+        ESP_LOGW(TAG, "terminal_print_at: 無効な引数");
+        return;
+    }
+
+    uint8_t rows = terminal->get_rows();
+    uint8_t cols = terminal->get_cols();
+
+    if (row >= rows) {
+        ESP_LOGW(TAG, "terminal_print_at: 行番号が範囲外 (%d)", row);
+        return;
+    }
+
+    uint8_t col = col_offset;
+    const char* ptr = str;
+
+    while (*ptr != '\0' && col < cols) {
+        int bytes_consumed = 0;
+        uint16_t font_index = utf8_to_font_index(ptr, &bytes_consumed);
+
+        if (bytes_consumed > 0) {
+            terminal->set_char(row, col, font_index);
+            col++;
+            ptr += bytes_consumed;
+        } else {
+            // 不正なシーケンスをスキップ
+            ptr++;
+        }
     }
 }
