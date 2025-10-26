@@ -197,6 +197,7 @@ void update_button_state(button_state_t *button);
 button_event_t get_button_event(button_state_t *button);
 void process_button_events(void);
 void encoder_task(void *parameter);
+void camera_preview_task(void *parameter);
 esp_err_t init_sd_card(void);
 void print_sd_card_info(void);
 esp_err_t init_external_i2c(void);
@@ -681,7 +682,128 @@ void encoder_task(void *parameter)
     }
 }
 
+// ★★★ カメラプレビュータスク ★★★
+void camera_preview_task(void *parameter)
+{
+    ESP_LOGI(TAG, "📷 カメラプレビュータスク開始");
 
+    const int PREVIEW_SIZE = 64;  // プレビューサイズ 64x64
+    const int UPDATE_INTERVAL_MS = 100;  // 更新間隔
+
+    // プレビュー用バッファ (64x64の2値データ、1ビット/ピクセル)
+    uint8_t *preview_buffer = (uint8_t *)heap_caps_malloc(PREVIEW_SIZE * PREVIEW_SIZE, MALLOC_CAP_8BIT);
+    if (preview_buffer == NULL)
+    {
+        ESP_LOGE(TAG, "❌ プレビューバッファ確保失敗");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    while (1)
+    {
+        if (g_camera_ready && g_display_ready)
+        {
+            // カメラからフレーム取得
+            camera_fb_t *fb = esp_camera_fb_get();
+            if (fb == NULL)
+            {
+                ESP_LOGW(TAG, "カメラフレーム取得失敗");
+                vTaskDelay(pdMS_TO_TICKS(UPDATE_INTERVAL_MS));
+                continue;
+            }
+
+            // 元画像のサイズを取得
+            int src_width = fb->width;
+            int src_height = fb->height;
+
+            // スケーリング計算（短い辺を64pxにする）
+            float scale_w = (float)PREVIEW_SIZE / src_width;
+            float scale_h = (float)PREVIEW_SIZE / src_height;
+            float scale = (scale_w > scale_h) ? scale_w : scale_h;  // 大きい方を採用（短い辺を64pxに）
+
+            int scaled_width = (int)(src_width * scale);
+            int scaled_height = (int)(src_height * scale);
+
+            // トリミングオフセット（センタートリミング）
+            int offset_x = (scaled_width - PREVIEW_SIZE) / 2;
+            int offset_y = (scaled_height - PREVIEW_SIZE) / 2;
+
+            // プレビュー画像生成（スケーリング + トリミング + 2値化）
+            for (int y = 0; y < PREVIEW_SIZE; y++)
+            {
+                for (int x = 0; x < PREVIEW_SIZE; x++)
+                {
+                    // スケールバック（プレビュー座標→元画像座標）
+                    int src_x = (int)((x + offset_x) / scale);
+                    int src_y = (int)((y + offset_y) / scale);
+
+                    // 範囲チェック
+                    if (src_x < 0) src_x = 0;
+                    if (src_x >= src_width) src_x = src_width - 1;
+                    if (src_y < 0) src_y = 0;
+                    if (src_y >= src_height) src_y = src_height - 1;
+
+                    // ピクセル値取得（RGB565フォーマットを想定）
+                    int pixel_index = src_y * src_width + src_x;
+                    uint8_t r, g, b;
+
+                    if (fb->format == PIXFORMAT_RGB565)
+                    {
+                        uint16_t pixel = ((uint16_t *)fb->buf)[pixel_index];
+                        r = ((pixel >> 11) & 0x1F) << 3;
+                        g = ((pixel >> 5) & 0x3F) << 2;
+                        b = (pixel & 0x1F) << 3;
+                    }
+                    else if (fb->format == PIXFORMAT_GRAYSCALE)
+                    {
+                        r = g = b = fb->buf[pixel_index];
+                    }
+                    else
+                    {
+                        // その他のフォーマットは未対応（黒にする）
+                        r = g = b = 0;
+                    }
+
+                    // 輝度計算（ITU-R BT.601）
+                    uint8_t luminance = (uint8_t)(0.299f * r + 0.587f * g + 0.114f * b);
+
+                    // 2値化（閾値128）
+                    preview_buffer[y * PREVIEW_SIZE + x] = (luminance >= 128) ? 1 : 0;
+                }
+            }
+
+            // フレームバッファ解放
+            esp_camera_fb_return(fb);
+
+            // ディスプレイに描画
+            g_display->clear();
+
+            for (int y = 0; y < PREVIEW_SIZE; y++)
+            {
+                for (int x = 0; x < PREVIEW_SIZE; x++)
+                {
+                    bool pixel = preview_buffer[y * PREVIEW_SIZE + x];
+                    g_display->set_pixel(x, y, pixel);
+                }
+            }
+
+            g_display->display();
+        }
+        else
+        {
+            // カメラまたはディスプレイが準備できていない
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(UPDATE_INTERVAL_MS));
+    }
+
+    // クリーンアップ（到達しない）
+    if (preview_buffer != NULL)
+    {
+        heap_caps_free(preview_buffer);
+    }
+}
 
 
 extern "C" void app_main(void)
@@ -819,6 +941,35 @@ extern "C" void app_main(void)
                                   tskIDLE_PRIORITY + 2, NULL);
     }
     display_init_step(&terminal, task_result == pdPASS);
+
+    // LCDクリア
+    if (g_display_ready)
+    {
+        g_display->clear();
+        g_display->display();
+    }
+
+    // カメラプレビュータスク開始
+    if (g_camera_ready && g_display_ready)
+    {
+        BaseType_t camera_task_result = xTaskCreate(
+            camera_preview_task,
+            "camera_preview",
+            8192,  // スタックサイズ
+            NULL,
+            tskIDLE_PRIORITY + 1,  // エンコーダーより低い優先度
+            NULL
+        );
+
+        if (camera_task_result == pdPASS)
+        {
+            ESP_LOGI(TAG, "✅ カメラプレビュータスク起動成功");
+        }
+        else
+        {
+            ESP_LOGE(TAG, "❌ カメラプレビュータスク起動失敗");
+        }
+    }
 
     // ===== 初期化完了 =====
     g_system_ready = true;
