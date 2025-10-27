@@ -9,6 +9,7 @@
 #include <sys/unistd.h>
 #include <sys/stat.h>
 #include <math.h>
+#include <dirent.h>
 
 // ESP-IDF 5.4コア
 #include "freertos/FreeRTOS.h"
@@ -50,6 +51,28 @@
 
 // 定数定義など... (省略、元のファイルと同じ)
 static const char *TAG = "PixelArtCamera";
+
+// BMPヘッダー構造体
+#pragma pack(push, 1)
+typedef struct {
+    uint16_t bfType;           // ファイルタイプ (0x4D42 = "BM")
+    uint32_t bfSize;           // ファイルサイズ
+    uint16_t bfReserved1;      // 予約領域1
+    uint16_t bfReserved2;      // 予約領域2
+    uint32_t bfOffBits;        // 画像データまでのオフセット
+    uint32_t biSize;           // 情報ヘッダサイズ
+    int32_t  biWidth;          // 画像の幅
+    int32_t  biHeight;         // 画像の高さ
+    uint16_t biPlanes;         // プレーン数
+    uint16_t biBitCount;       // 1ピクセルあたりのビット数
+    uint32_t biCompression;    // 圧縮形式
+    uint32_t biSizeImage;      // 画像データサイズ
+    int32_t  biXPelsPerMeter;  // 水平解像度
+    int32_t  biYPelsPerMeter;  // 垂直解像度
+    uint32_t biClrUsed;        // 使用する色数
+    uint32_t biClrImportant;   // 重要な色数
+} bitmap_header_t;
+#pragma pack(pop)
 
 #define SHUTTER_BUTTON_PIN GPIO_NUM_38
 #define MENU_BUTTON_PIN GPIO_NUM_39
@@ -118,14 +141,15 @@ typedef enum
     SYSTEM_STATUS_INITIALIZING,
     SYSTEM_STATUS_READY,
     SYSTEM_STATUS_CAPTURING,
-    SYSTEM_STATUS_PROCESSING,
     SYSTEM_STATUS_SAVING,
-    SYSTEM_STATUS_ERROR
+    SYSTEM_STATUS_ERROR,
+    SYSTEM_MENU_MODE,
 } system_status_t;
 
 // グローバル変数 - エンコーダーのみC構造体に変更
 static SemaphoreHandle_t g_capture_semaphore = NULL;
 static SemaphoreHandle_t g_i2c_mutex = NULL;
+static SemaphoreHandle_t g_display_mutex = NULL;
 static QueueHandle_t g_capture_queue = NULL;
 static QueueHandle_t g_encoder_event_queue = NULL;
 
@@ -147,8 +171,11 @@ static button_state_t g_menu_button = {
     .long_press_triggered = false,
     .name = "Menu"};
 
+// 現在選択中のパレット
 static volatile int g_current_palette_index = 0;
-static volatile int g_file_counter = 1;
+// 撮影画像ファイル連番
+static volatile int g_file_counter = 0;
+
 static volatile uint32_t g_last_button_press = 0;
 
 // ハードウェアオブジェクト - エンコーダーのみC構造体に変更
@@ -162,6 +189,7 @@ static bool g_encoder_ready = false;
 static bool g_display_ready = false;
 static bool g_sd_card_ready = false;
 
+// システム状態管理
 static volatile system_status_t g_system_status = SYSTEM_STATUS_INITIALIZING;
 static volatile bool g_status_led_enabled = true;
 
@@ -169,17 +197,28 @@ static sdmmc_card_t *g_sd_card = NULL;
 static const char *g_mount_point = "/sdcard";
 static bool g_sd_card_mounted = false;
 
-// カラーパレット定義
+// ========================================
+// カラーパレット定義（8種類×8色）
+// ========================================
 static const uint32_t COLOR_PALETTES[8][8] = {
-    {0x0D2B45, 0x203C56, 0x544E68, 0x8D697A, 0xD08159, 0xFFAA5E, 0xFFD4A3, 0xFFECD6},
-    {0x000000, 0x000B22, 0x112B43, 0x437290, 0x437290, 0xE0D8D1, 0xE0D8D1, 0xFFFFFF},
-    {0x010101, 0x33669F, 0x33669F, 0x33669F, 0x498DB7, 0x498DB7, 0xFBE379, 0xFBE379},
-    {0x0E0E12, 0x1A1A24, 0x333346, 0x535373, 0x8080A4, 0xA6A6BF, 0xC1C1D2, 0xE6E6EC},
-    {0x1E1C32, 0x1E1C32, 0x1E1C32, 0x1E1C32, 0xC6BAAC, 0xC6BAAC, 0xC6BAAC, 0xC6BAAC},
-    {0x252525, 0x252525, 0x4B564D, 0x4B564D, 0x9AA57C, 0x9AA57C, 0xE0E9C4, 0xE0E9C4},
-    {0x001D2A, 0x085562, 0x009A98, 0x00BE91, 0x38D88E, 0x9AF089, 0xF2FF66, 0xF2FF66},
-    {0x000000, 0x012036, 0x3A7BAA, 0x7D8FAE, 0xA1B4C1, 0xF0B9B9, 0xFFD159, 0xFFFFFF},
+  { // パレット0 slso8
+    0x0D2B45, 0x203C56, 0x544E68, 0x8D697A, 0xD08159, 0xFFAA5E, 0xFFD4A3, 0xFFECD6 },
+  { // パレット1 都市伝説解体センター風
+    0x000000, 0x000B22, 0x112B43, 0x437290, 0x437290, 0xE0D8D1, 0xE0D8D1, 0xFFFFFF },
+  { // パレット2 ファミレスを享受せよ風
+    0x010101, 0x33669F, 0x33669F, 0x33669F, 0x498DB7, 0x498DB7, 0xFBE379, 0xFBE379 },
+  { // パレット3 gothic-bit
+    0x0E0E12, 0x1A1A24, 0x333346, 0x535373, 0x8080A4, 0xA6A6BF, 0xC1C1D2, 0xE6E6EC },
+  { // パレット4 noire-truth
+    0x1E1C32, 0x1E1C32, 0x1E1C32, 0x1E1C32, 0xC6BAAC, 0xC6BAAC, 0xC6BAAC, 0xC6BAAC },
+  { // パレット5 2BIT DEMIBOY
+    0x252525, 0x252525, 0x4B564D, 0x4B564D, 0x9AA57C, 0x9AA57C, 0xE0E9C4, 0xE0E9C4 },
+  { // パレット6 deep-maze
+    0x001D2A, 0x085562, 0x009A98, 0x00BE91, 0x38D88E, 0x9AF089, 0xF2FF66, 0xF2FF66 },
+  { // パレット7 night-rain
+    0x000000, 0x012036, 0x3A7BAA, 0x7D8FAE, 0xA1B4C1, 0xF0B9B9, 0xFFD159, 0xFFFFFF },
 };
+
 
 static const uint32_t PALETTE_REP_COLORS[8] = {
     0x8D697A,
@@ -192,12 +231,25 @@ static const uint32_t PALETTE_REP_COLORS[8] = {
     0xFFD159,
 };
 
+static const char* PALETTE_NAMES[8] = {
+    "slso8",
+    "legend",
+    "famires",
+    "gothic",
+    "noire",
+    "demiboy",
+    "maze",
+    "night"
+};
+
 // 関数プロトタイプ
 void update_button_state(button_state_t *button);
 button_event_t get_button_event(button_state_t *button);
 void process_button_events(void);
 void encoder_task(void *parameter);
 void camera_preview_task(void *parameter);
+void histogram_task(void *parameter);
+void capture_task(void *parameter);
 esp_err_t init_sd_card(void);
 void print_sd_card_info(void);
 esp_err_t init_external_i2c(void);
@@ -206,6 +258,12 @@ esp_err_t init_gpio(void);
 void display_init_step(Terminal *terminal, const char *step_name);
 void display_init_step(Terminal *terminal, bool success);
 void run_display_test_patterns(void);
+void init_file_counter_from_sd(void);
+void generate_random_string(char* buf, int len);
+void apply_palette_reduction(uint8_t* rgb_data, int width, int height, int palette_idx);
+esp_err_t save_rgb_as_bmp(uint8_t* rgb_data, int width, int height, const char* filepath);
+void draw_progress_bar(float progress, const char* status_text = nullptr);
+void start_capture(bool all_palettes);
 
 // ★★★ 初期化ステップ表示ヘルパー関数 ★★★
 void display_init_step(Terminal *terminal, const char *step_name)
@@ -493,9 +551,16 @@ button_event_t get_button_event(button_state_t *button)
     if (!button->current_state && button->last_state)
     {
         uint32_t press_duration = button->last_change_time - button->press_start_time;
+        button->last_state = false;  // ★ イベント処理後に状態をクリア
+
         if (press_duration < BUTTON_LONG_PRESS_MS)
         {
             return BUTTON_EVENT_SHORT_PRESS;
+        }
+        else
+        {
+            // 長押し後のリリースもクリア
+            return BUTTON_EVENT_NONE;
         }
     }
 
@@ -504,15 +569,28 @@ button_event_t get_button_event(button_state_t *button)
 
 void process_button_events(void)
 {
+    // 撮影中または保存中は入力を無視
+    if (g_system_status == SYSTEM_STATUS_CAPTURING || g_system_status == SYSTEM_STATUS_SAVING)
+    {
+        return;
+    }
+
     button_event_t shutter_event = get_button_event(&g_shutter_button);
+
+    if (shutter_event != BUTTON_EVENT_NONE)
+    {
+        ESP_LOGI(TAG, "🔔 シャッターボタンイベント検出: %d", shutter_event);
+    }
+
     switch (shutter_event)
     {
     case BUTTON_EVENT_SHORT_PRESS:
-        ESP_LOGI(TAG, "📸 シャッター短押し: ディスプレイテスト再実行");
-
+        ESP_LOGI(TAG, "📸 シャッター短押し: 選択中のパレットで撮影");
+        start_capture(false);  // 単一パレット撮影
         break;
     case BUTTON_EVENT_LONG_PRESS:
         ESP_LOGI(TAG, "📸 シャッター長押し: 全パレット撮影");
+        start_capture(true);   // 全パレット撮影
         break;
     default:
         break;
@@ -569,7 +647,7 @@ void encoder_task(void *parameter)
 
     while (1)
     {
-        if (g_encoder_ready)
+        if (g_encoder_ready && g_system_status == SYSTEM_STATUS_READY)
         {
             // エンコーダー値を読み取り（新APIを使用）
             int16_t current_value = pimoroni_encoder_read(&g_encoder);
@@ -701,6 +779,13 @@ void camera_preview_task(void *parameter)
 
     while (1)
     {
+        // 撮影中または保存中はプレビューを停止
+        if (g_system_status != SYSTEM_STATUS_READY)
+        {
+            vTaskDelay(pdMS_TO_TICKS(UPDATE_INTERVAL_MS));
+            continue;
+        }
+
         if (g_camera_ready && g_display_ready)
         {
             // カメラからフレーム取得
@@ -775,19 +860,25 @@ void camera_preview_task(void *parameter)
             // フレームバッファ解放
             esp_camera_fb_return(fb);
 
-            // ディスプレイに描画
-            g_display->clear();
-
-            for (int y = 0; y < PREVIEW_SIZE; y++)
+            // ディスプレイに描画（ミューテックス保護）
+            if (g_display_mutex != NULL && xSemaphoreTake(g_display_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
             {
-                for (int x = 0; x < PREVIEW_SIZE; x++)
-                {
-                    bool pixel = preview_buffer[y * PREVIEW_SIZE + x];
-                    g_display->set_pixel(x, y, pixel);
-                }
-            }
+                g_display->clear();
 
-            g_display->display();
+                for (int y = 0; y < PREVIEW_SIZE; y++)
+                {
+                    for (int x = 0; x < PREVIEW_SIZE; x++)
+                    {
+                        bool pixel = preview_buffer[y * PREVIEW_SIZE + x];
+                        g_display->set_pixel(x, y, pixel);
+                    }
+                }
+
+                // display()はヒストグラムタスクに任せるため、ここでは呼ばない
+                // g_display->display();
+
+                xSemaphoreGive(g_display_mutex);
+            }
         }
         else
         {
@@ -802,6 +893,619 @@ void camera_preview_task(void *parameter)
     if (preview_buffer != NULL)
     {
         heap_caps_free(preview_buffer);
+    }
+}
+
+// ★★★ ヒストグラムタスク ★★★
+void histogram_task(void *parameter)
+{
+    ESP_LOGI(TAG, "📊 ヒストグラムタスク開始");
+
+    const int HISTOGRAM_BINS = 16;  // 明るさを16段階に分割
+    const int UPDATE_INTERVAL_MS = 200;  // 更新間隔
+    const int GRAPH_X = 64;  // グラフの開始X座標
+    const int GRAPH_Y = 48;  // グラフの開始Y座標
+    const int GRAPH_WIDTH = 16;  // グラフの幅（16本の棒）
+    const int GRAPH_HEIGHT = 16;  // グラフの高さ
+    const float MAX_PERCENTAGE = 50.0f;  // グラフ最大値 = 50%
+    const int WARNING_X = 80;  // 警告表示のX座標
+    const int WARNING_Y = 56;  // 警告表示のY座標
+    const float OVEREXPOSURE_PERCENTAGE = 10.0f;  // 白飛び検出閾値（総ピクセル数の10%）
+
+    uint32_t histogram[HISTOGRAM_BINS] = {0};
+
+    while (1)
+    {
+        // 撮影中または保存中はヒストグラムを停止
+        if (g_system_status != SYSTEM_STATUS_READY)
+        {
+            vTaskDelay(pdMS_TO_TICKS(UPDATE_INTERVAL_MS));
+            continue;
+        }
+
+        if (g_camera_ready && g_display_ready)
+        {
+            // カメラからフレーム取得
+            camera_fb_t *fb = esp_camera_fb_get();
+            if (fb == NULL)
+            {
+                ESP_LOGW(TAG, "ヒストグラム: カメラフレーム取得失敗");
+                vTaskDelay(pdMS_TO_TICKS(UPDATE_INTERVAL_MS));
+                continue;
+            }
+
+            // ヒストグラムをリセット
+            memset(histogram, 0, sizeof(histogram));
+
+            // 元画像のサイズを取得
+            int src_width = fb->width;
+            int src_height = fb->height;
+            int total_pixels = src_width * src_height;
+
+            // 全ピクセルの明るさを計算してヒストグラムに集計
+            for (int y = 0; y < src_height; y++)
+            {
+                for (int x = 0; x < src_width; x++)
+                {
+                    int pixel_index = y * src_width + x;
+                    uint8_t r, g, b;
+
+                    if (fb->format == PIXFORMAT_RGB565)
+                    {
+                        uint16_t pixel = ((uint16_t *)fb->buf)[pixel_index];
+                        r = ((pixel >> 11) & 0x1F) << 3;
+                        g = ((pixel >> 5) & 0x3F) << 2;
+                        b = (pixel & 0x1F) << 3;
+                    }
+                    else if (fb->format == PIXFORMAT_GRAYSCALE)
+                    {
+                        r = g = b = fb->buf[pixel_index];
+                    }
+                    else
+                    {
+                        r = g = b = 0;
+                    }
+
+                    // 輝度計算（ITU-R BT.601）
+                    uint8_t luminance = (uint8_t)(0.299f * r + 0.587f * g + 0.114f * b);
+
+                    // ヒストグラムのビン番号を計算（0-255を16段階に分割）
+                    int bin = luminance / 16;
+                    if (bin >= HISTOGRAM_BINS) bin = HISTOGRAM_BINS - 1;
+
+                    histogram[bin]++;
+                }
+            }
+
+            // フレームバッファ解放
+            esp_camera_fb_return(fb);
+
+            // 白飛び検出閾値を計算（総ピクセル数の割合ベース）
+            int overexposure_threshold = (int)(total_pixels * OVEREXPOSURE_PERCENTAGE / 100.0f);
+            bool overexposed = (histogram[HISTOGRAM_BINS - 1] >= overexposure_threshold);
+
+            // ディスプレイに描画（ミューテックス保護）
+            if (g_display_mutex != NULL && xSemaphoreTake(g_display_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+            {
+                // ヒストグラムグラフを描画（縦棒グラフ、割合ベース）
+                for (int i = 0; i < HISTOGRAM_BINS; i++)
+                {
+                    // 割合を計算
+                    float percentage = (histogram[i] * 100.0f) / total_pixels;
+
+                    // 棒の高さを計算（50%が最大値）
+                    int bar_height = (int)((percentage * GRAPH_HEIGHT) / MAX_PERCENTAGE);
+                    if (bar_height > GRAPH_HEIGHT) bar_height = GRAPH_HEIGHT;
+
+                    // 棒を下から上に描画
+                    int bar_x = GRAPH_X + i;
+                    for (int h = 0; h < bar_height; h++)
+                    {
+                        int bar_y = GRAPH_Y + GRAPH_HEIGHT - 1 - h;  // 下から上へ
+                        g_display->set_pixel(bar_x, bar_y, true);
+                    }
+                }
+
+                // 白飛び警告表示
+                if (overexposed)
+                {
+                    // 「！」マークを表示（簡易的に縦線と点で表現）
+                    // 縦線（3ピクセル）
+                    g_display->set_pixel(WARNING_X, WARNING_Y, true);
+                    g_display->set_pixel(WARNING_X, WARNING_Y + 1, true);
+                    g_display->set_pixel(WARNING_X, WARNING_Y + 2, true);
+                    // 点（1ピクセル、1ピクセル空けて）
+                    g_display->set_pixel(WARNING_X, WARNING_Y + 4, true);
+
+                    // 割合も計算してログ出力
+                    float overexposed_percentage = (histogram[HISTOGRAM_BINS - 1] * 100.0f) / total_pixels;
+                    ESP_LOGW(TAG, "⚠️ 白飛び検出: 最大明るさ段階に%ld個のピクセル (%.1f%%)",
+                             histogram[HISTOGRAM_BINS - 1], overexposed_percentage);
+                }
+
+                // 画面を更新（このタスクが最後に呼ぶ）
+                g_display->display();
+
+                xSemaphoreGive(g_display_mutex);
+            }
+        }
+        else
+        {
+            // カメラまたはディスプレイが準備できていない
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(UPDATE_INTERVAL_MS));
+    }
+}
+
+// ★★★ 撮影機能ヘルパー関数 ★★★
+
+// SDカードから最大ファイル番号を検索してg_file_counterを初期化
+void init_file_counter_from_sd(void)
+{
+    if (!g_sd_card_mounted)
+    {
+        ESP_LOGW(TAG, "SDカード未マウント: ファイルカウンター初期化スキップ");
+        return;
+    }
+
+    DIR* dir = opendir(g_mount_point);
+    if (dir == NULL)
+    {
+        ESP_LOGE(TAG, "ディレクトリ開けません: %s", g_mount_point);
+        return;
+    }
+
+    int max_number = 0;
+    struct dirent* entry;
+
+    while ((entry = readdir(dir)) != NULL)
+    {
+        // ファイル名が数字4桁で始まるものを検索
+        if (entry->d_type == DT_REG && strlen(entry->d_name) >= 4)
+        {
+            int num = 0;
+            if (sscanf(entry->d_name, "%04d_", &num) == 1)
+            {
+                if (num > max_number)
+                {
+                    max_number = num;
+                }
+            }
+        }
+    }
+
+    closedir(dir);
+
+    g_file_counter = max_number + 1;
+    ESP_LOGI(TAG, "ファイルカウンター初期化: %d", g_file_counter);
+}
+
+// ランダムな英数字列を生成（大文字小文字含む）
+void generate_random_string(char* buf, int len)
+{
+    const char charset[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    const int charset_size = sizeof(charset) - 1;
+
+    for (int i = 0; i < len; i++)
+    {
+        uint32_t rand_val = esp_random();
+        buf[i] = charset[rand_val % charset_size];
+    }
+    buf[len] = '\0';
+}
+
+// パレット減色アルゴリズム（最近傍色探索）
+void apply_palette_reduction(uint8_t* rgb_data, int width, int height, int palette_idx)
+{
+    const uint32_t* palette = COLOR_PALETTES[palette_idx];
+
+    for (int i = 0; i < width * height; i++)
+    {
+        int pixel_offset = i * 3;
+        uint8_t r = rgb_data[pixel_offset];
+        uint8_t g = rgb_data[pixel_offset + 1];
+        uint8_t b = rgb_data[pixel_offset + 2];
+
+        // 最近傍色を探索
+        int min_distance = INT32_MAX;
+        uint32_t closest_color = palette[0];
+
+        for (int j = 0; j < 8; j++)
+        {
+            uint32_t pal_color = palette[j];
+            int pal_r = (pal_color >> 16) & 0xFF;
+            int pal_g = (pal_color >> 8) & 0xFF;
+            int pal_b = pal_color & 0xFF;
+
+            int dr = r - pal_r;
+            int dg = g - pal_g;
+            int db = b - pal_b;
+            int distance = dr * dr + dg * dg + db * db;
+
+            if (distance < min_distance)
+            {
+                min_distance = distance;
+                closest_color = pal_color;
+            }
+        }
+
+        // 最近傍色で置き換え
+        rgb_data[pixel_offset] = (closest_color >> 16) & 0xFF;
+        rgb_data[pixel_offset + 1] = (closest_color >> 8) & 0xFF;
+        rgb_data[pixel_offset + 2] = closest_color & 0xFF;
+    }
+}
+
+// RGB画像をBMP形式でSDカードに保存
+esp_err_t save_rgb_as_bmp(uint8_t* rgb_data, int width, int height, const char* filepath)
+{
+    // 行サイズを計算（4バイトアライメント）
+    int row_size = (3 * width + 3) & ~3;
+
+    // BMPヘッダー作成
+    bitmap_header_t header;
+    header.bfType = 0x4D42;  // "BM"
+    header.bfSize = row_size * height + sizeof(bitmap_header_t);
+    header.bfReserved1 = 0;
+    header.bfReserved2 = 0;
+    header.bfOffBits = sizeof(bitmap_header_t);
+    header.biSize = 40;
+    header.biWidth = width;
+    header.biHeight = height;
+    header.biPlanes = 1;
+    header.biBitCount = 24;
+    header.biCompression = 0;
+    header.biSizeImage = 0;
+    header.biXPelsPerMeter = 2835;
+    header.biYPelsPerMeter = 2835;
+    header.biClrUsed = 0;
+    header.biClrImportant = 0;
+
+    // ファイルオープン
+    FILE* file = fopen(filepath, "wb");
+    if (file == NULL)
+    {
+        ESP_LOGE(TAG, "ファイル開けません: %s", filepath);
+        return ESP_FAIL;
+    }
+
+    // ヘッダー書き込み
+    size_t written = fwrite(&header, sizeof(bitmap_header_t), 1, file);
+    if (written != 1)
+    {
+        ESP_LOGE(TAG, "ヘッダー書き込み失敗: %s", filepath);
+        fclose(file);
+        return ESP_FAIL;
+    }
+
+    // 行バッファ確保
+    uint8_t* row_buffer = (uint8_t*)malloc(row_size);
+    if (row_buffer == NULL)
+    {
+        ESP_LOGE(TAG, "行バッファ確保失敗");
+        fclose(file);
+        return ESP_ERR_NO_MEM;
+    }
+
+    // ピクセルデータ書き込み（下から上へ、BGRの順）
+    memset(row_buffer, 0, row_size);  // パディング部分をゼロクリア
+
+    for (int y = height - 1; y >= 0; y--)
+    {
+        for (int x = 0; x < width; x++)
+        {
+            int src_offset = (y * width + x) * 3;
+            int dst_offset = x * 3;
+
+            // RGB → BGR変換
+            row_buffer[dst_offset] = rgb_data[src_offset + 2];      // B
+            row_buffer[dst_offset + 1] = rgb_data[src_offset + 1];  // G
+            row_buffer[dst_offset + 2] = rgb_data[src_offset];      // R
+        }
+
+        written = fwrite(row_buffer, row_size, 1, file);
+        if (written != 1)
+        {
+            ESP_LOGE(TAG, "ピクセルデータ書き込み失敗: %s (行: %d)", filepath, y);
+            free(row_buffer);
+            fclose(file);
+            return ESP_FAIL;
+        }
+    }
+
+    // クリーンアップ
+    free(row_buffer);
+    fclose(file);
+
+    ESP_LOGI(TAG, "BMP保存成功: %s (%ld bytes)", filepath, header.bfSize);
+    return ESP_OK;
+}
+
+// プログレスバー描画（画面中央、横幅128px、高さ3px、枠線1px）
+void draw_progress_bar(float progress, const char* status_text)
+{
+    if (!g_display_ready || g_display == nullptr)
+    {
+        return;
+    }
+
+    const int BAR_WIDTH = 128;
+    const int BAR_HEIGHT = 3;
+    const int BAR_X = 0;
+    const int BAR_Y = (64 - BAR_HEIGHT) / 2;  // 画面中央
+    const int TEXT_Y = 18;  // 状態テキストのY座標（プログレスバーの上）
+    
+    // 画面クリア
+    g_display->clear();
+
+    // 状態テキストを表示（指定されている場合）
+    if (status_text != nullptr)
+    {
+        // テキストを中央揃えで表示
+        g_display->draw_string(0, TEXT_Y, status_text, true);
+    }
+
+    // 枠線描画（白）
+    for (int x = BAR_X; x < BAR_X + BAR_WIDTH; x++)
+    {
+        g_display->set_pixel(x, BAR_Y, true);  // 上
+        g_display->set_pixel(x, BAR_Y + BAR_HEIGHT - 1, true);  // 下
+    }
+    for (int y = BAR_Y; y < BAR_Y + BAR_HEIGHT; y++)
+    {
+        g_display->set_pixel(BAR_X, y, true);  // 左
+        g_display->set_pixel(BAR_X + BAR_WIDTH - 1, y, true);  // 右
+    }
+
+    // プログレス部分を描画（白、内側）
+    int progress_width = (int)((BAR_WIDTH - 2) * progress);  // 枠線分を引く
+    for (int y = BAR_Y + 1; y < BAR_Y + BAR_HEIGHT - 1; y++)
+    {
+        for (int x = BAR_X + 1; x < BAR_X + 1 + progress_width; x++)
+        {
+            g_display->set_pixel(x, y, true);
+        }
+    }
+
+    g_display->display();
+}
+
+// ★★★ 撮影タスク ★★★
+void capture_task(void *parameter)
+{
+    bool all_palettes = *((bool *)parameter);
+    free(parameter);  // パラメータメモリ解放
+
+    ESP_LOGI(TAG, "📸 撮影タスク開始 (全パレット: %s)", all_palettes ? "Yes" : "No");
+    ESP_LOGI(TAG, "   現在の状態: %d → CAPTURING に変更", g_system_status);
+
+    // システム状態を撮影中に変更
+    g_system_status = SYSTEM_STATUS_CAPTURING;
+    ESP_LOGI(TAG, "   状態変更完了: %d", g_system_status);
+
+    // ランダム文字列生成
+    char random_str[5];
+    generate_random_string(random_str, 4);
+    ESP_LOGI(TAG, "   ランダム文字列: %s", random_str);
+    ESP_LOGI(TAG, "   ファイルカウンター: %d", g_file_counter);
+
+    int total_steps = all_palettes ? 9 : 2;  // 元画像 + パレット数
+    int current_step = 0;
+    ESP_LOGI(TAG, "   総ステップ数: %d", total_steps);
+
+    // カメラからフレーム取得
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (fb == NULL)
+    {
+        ESP_LOGE(TAG, "❌ カメラフレーム取得失敗");
+        g_system_status = SYSTEM_STATUS_ERROR;
+
+        // エラー表示
+        if (g_display_ready && g_display_mutex != NULL && xSemaphoreTake(g_display_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+        {
+            g_display->clear();
+            // 簡易的なエラー表示（Xマーク）
+            for (int i = 0; i < 16; i++)
+            {
+                g_display->set_pixel(56 + i, 24 + i, true);  // 左上から右下
+                g_display->set_pixel(56 + i, 40 - i, true);  // 左下から右上
+            }
+            g_display->display();
+            xSemaphoreGive(g_display_mutex);
+        }
+
+        // 無限ループ
+        while (1)
+        {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
+
+    int src_width = fb->width;
+    int src_height = fb->height;
+    size_t rgb_buffer_size = src_width * src_height * 3;
+
+    // RGB888バッファ確保
+    uint8_t *rgb_buffer = (uint8_t *)heap_caps_malloc(rgb_buffer_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (rgb_buffer == NULL)
+    {
+        ESP_LOGE(TAG, "❌ RGBバッファ確保失敗");
+        esp_camera_fb_return(fb);
+        g_system_status = SYSTEM_STATUS_ERROR;
+        while (1)
+        {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
+
+    // RGB565 → RGB888変換（ビッグエンディアン）
+    uint8_t* fb_data = fb->buf;
+    for (int i = 0; i < src_width * src_height; i++)
+    {
+        // RGB565をビッグエンディアンで読み取り
+        uint16_t rgb565Color = (fb_data[i * 2] << 8) | fb_data[i * 2 + 1];
+
+        // RGB565からRGB888へ変換
+        uint8_t r = ((rgb565Color >> 11) & 0x1F) * 255 / 31;
+        uint8_t g = ((rgb565Color >> 5) & 0x3F) * 255 / 63;
+        uint8_t b = (rgb565Color & 0x1F) * 255 / 31;
+
+        rgb_buffer[i * 3] = r;
+        rgb_buffer[i * 3 + 1] = g;
+        rgb_buffer[i * 3 + 2] = b;
+    }
+
+    ESP_LOGI(TAG, "   RGB565→RGB888変換完了");
+
+    // フレームバッファ解放
+    esp_camera_fb_return(fb);
+
+    // 保存状態に変更
+    g_system_status = SYSTEM_STATUS_SAVING;
+
+    // 元画像保存
+    char filepath[128];
+    snprintf(filepath, sizeof(filepath), "%s/%04d_%s_Original.bmp", g_mount_point, g_file_counter, random_str);
+
+    if (g_display_mutex != NULL && xSemaphoreTake(g_display_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+    {
+        draw_progress_bar((float)current_step / total_steps, "ほぞんちゅう origin");
+        xSemaphoreGive(g_display_mutex);
+    }
+
+    esp_err_t result = save_rgb_as_bmp(rgb_buffer, src_width, src_height, filepath);
+    if (result != ESP_OK)
+    {
+        ESP_LOGE(TAG, "❌ 元画像保存失敗");
+        heap_caps_free(rgb_buffer);
+        g_system_status = SYSTEM_STATUS_ERROR;
+        while (1)
+        {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
+
+    current_step++;
+    ESP_LOGI(TAG, "✅ 元画像保存完了 (%d/%d)", current_step, total_steps);
+
+    // パレット減色画像保存
+    int palette_count = all_palettes ? 8 : 1;
+    int start_palette = all_palettes ? 0 : g_current_palette_index;
+
+    for (int i = 0; i < palette_count; i++)
+    {
+        int palette_idx = all_palettes ? i : start_palette;
+
+        // RGB888バッファをコピー（減色処理は破壊的なため）
+        uint8_t *temp_buffer = (uint8_t *)heap_caps_malloc(rgb_buffer_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (temp_buffer == NULL)
+        {
+            ESP_LOGE(TAG, "❌ 一時バッファ確保失敗");
+            heap_caps_free(rgb_buffer);
+            g_system_status = SYSTEM_STATUS_ERROR;
+            while (1)
+            {
+                vTaskDelay(pdMS_TO_TICKS(1000));
+            }
+        }
+
+        memcpy(temp_buffer, rgb_buffer, rgb_buffer_size);
+
+        // プログレスバー更新
+        if (g_display_mutex != NULL && xSemaphoreTake(g_display_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+        {
+            draw_progress_bar((float)current_step / total_steps, "ほぞんちゅう palette");
+            xSemaphoreGive(g_display_mutex);
+        }
+
+        // パレット減色
+        apply_palette_reduction(temp_buffer, src_width, src_height, palette_idx);
+
+        // ファイル名生成
+        snprintf(filepath, sizeof(filepath), "%s/%04d_%s_%s.bmp",
+                 g_mount_point, g_file_counter, random_str, PALETTE_NAMES[palette_idx]);
+
+        // BMP保存
+        result = save_rgb_as_bmp(temp_buffer, src_width, src_height, filepath);
+        heap_caps_free(temp_buffer);
+
+        if (result != ESP_OK)
+        {
+            ESP_LOGE(TAG, "❌ パレット画像保存失敗: %s", PALETTE_NAMES[palette_idx]);
+            heap_caps_free(rgb_buffer);
+            g_system_status = SYSTEM_STATUS_ERROR;
+            while (1)
+            {
+                vTaskDelay(pdMS_TO_TICKS(1000));
+            }
+        }
+
+        current_step++;
+        ESP_LOGI(TAG, "✅ パレット画像保存完了: %s (%d/%d)", PALETTE_NAMES[palette_idx], current_step, total_steps);
+    }
+
+    // メモリ解放
+    heap_caps_free(rgb_buffer);
+
+    // ファイルカウンター更新
+    g_file_counter++;
+
+    // 最終プログレスバー表示
+    if (g_display_mutex != NULL && xSemaphoreTake(g_display_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+    {
+        draw_progress_bar(1.0f);
+        xSemaphoreGive(g_display_mutex);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(500));  // 完了表示
+
+    // システム状態を元に戻す
+    ESP_LOGI(TAG, "   状態を READY に戻します (現在: %d)", g_system_status);
+    g_system_status = SYSTEM_STATUS_READY;
+    ESP_LOGI(TAG, "   状態変更完了: %d", g_system_status);
+
+    ESP_LOGI(TAG, "🎉 撮影完了！タスクを削除します");
+
+    // タスク自己削除
+    vTaskDelete(NULL);
+    ESP_LOGI(TAG, "❌ この行は実行されないはず");  // デバッグ用
+}
+
+// 撮影開始（タスク生成）
+void start_capture(bool all_palettes)
+{
+    ESP_LOGI(TAG, "🚀 start_capture() 呼び出し (all_palettes: %s)", all_palettes ? "Yes" : "No");
+    ESP_LOGI(TAG, "   現在の状態: %d", g_system_status);
+
+    // パラメータをヒープに確保
+    bool *param = (bool *)malloc(sizeof(bool));
+    if (param == NULL)
+    {
+        ESP_LOGE(TAG, "❌ パラメータメモリ確保失敗");
+        return;
+    }
+    *param = all_palettes;
+
+    ESP_LOGI(TAG, "   撮影タスクを作成します...");
+
+    BaseType_t result = xTaskCreate(
+        capture_task,
+        "capture_task",
+        16384,  // スタックサイズ
+        (void *)param,
+        tskIDLE_PRIORITY + 2,
+        NULL);
+
+    if (result != pdPASS)
+    {
+        ESP_LOGE(TAG, "❌ 撮影タスク作成失敗");
+        free(param);
+    }
+    else
+    {
+        ESP_LOGI(TAG, "✅ 撮影タスク作成成功");
     }
 }
 
@@ -901,6 +1605,8 @@ extern "C" void app_main(void)
     if (g_sd_card_ready)
     {
         print_sd_card_info();
+        // ファイルカウンター初期化
+        init_file_counter_from_sd();
     }
 
     // エンコーダー初期化
@@ -926,10 +1632,11 @@ extern "C" void app_main(void)
         pimoroni_encoder_set_led(&g_encoder, r, g, b);
     }
 
-    // キュー作成
+    // キュー・ミューテックス作成
     display_init_step(&terminal, " Queue create");
     g_encoder_event_queue = xQueueCreate(10, sizeof(encoder_event_t));
-    display_init_step(&terminal, g_encoder_event_queue != NULL);
+    g_display_mutex = xSemaphoreCreateMutex();
+    display_init_step(&terminal, g_encoder_event_queue != NULL && g_display_mutex != NULL);
 
     // エンコーダータスク開始
     display_init_step(&terminal, " Task start");
@@ -971,8 +1678,31 @@ extern "C" void app_main(void)
         }
     }
 
+    // ヒストグラムタスク開始
+    if (g_camera_ready && g_display_ready && g_display_mutex != NULL)
+    {
+        BaseType_t histogram_task_result = xTaskCreate(
+            histogram_task,
+            "histogram",
+            8192,  // スタックサイズ
+            NULL,
+            tskIDLE_PRIORITY + 1,  // プレビューと同じ優先度
+            NULL
+        );
+
+        if (histogram_task_result == pdPASS)
+        {
+            ESP_LOGI(TAG, "✅ ヒストグラムタスク起動成功");
+        }
+        else
+        {
+            ESP_LOGE(TAG, "❌ ヒストグラムタスク起動失敗");
+        }
+    }
+
     // ===== 初期化完了 =====
     g_system_ready = true;
+    g_system_status = SYSTEM_STATUS_READY;  // システム状態をREADYに設定
     ESP_LOGI(TAG, "🎉 システム初期化完了！");
 
     // 完了メッセージ表示（2秒）

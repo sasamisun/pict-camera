@@ -417,8 +417,43 @@ void SSD1306Display::draw_terminal(const Terminal* terminal)
 
 void SSD1306Display::draw_string(int16_t x, int16_t y, const char* text, bool white)
 {
-    ESP_LOGI(TAG, "文字列描画: (%d,%d) \"%s\"", x, y, text);
-    // 実装はスタブ - 実際のフォント描画は複雑なので省略
+    ESP_LOGD(TAG, "文字列描画: (%d,%d) \"%s\"", x, y, text);
+
+    if (!text || !_frame_buffer) {
+        ESP_LOGW(TAG, "無効な引数またはフレームバッファ未初期化");
+        return;
+    }
+
+    int16_t cursor_x = x;
+    const char* ptr = text;
+
+    while (*ptr != '\0') {
+        int bytes_consumed = 0;
+
+        // UTF-8文字を美咲フォントインデックスに変換
+        uint16_t char_index = utf8_to_font_index(ptr, &bytes_consumed);
+
+        if (bytes_consumed == 0) {
+            // デコード失敗（不正なUTF-8）
+            ESP_LOGW(TAG, "UTF-8デコード失敗");
+            break;
+        }
+
+        // 文字を描画
+        draw_char(char_index, cursor_x, y, white);
+
+        // カーソルを右に移動（8ピクセル = 美咲フォント幅）
+        cursor_x += MISAKI_CHAR_WIDTH;
+
+        // 次の文字へ
+        ptr += bytes_consumed;
+
+        // 画面右端を超えたら終了
+        if (cursor_x >= SSD1306_WIDTH) {
+            ESP_LOGD(TAG, "画面右端到達、描画終了");
+            break;
+        }
+    }
 }
 
 void SSD1306Display::draw_hline(int16_t x, int16_t y, int16_t width, bool white)
