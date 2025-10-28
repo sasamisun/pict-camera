@@ -76,7 +76,6 @@ typedef struct {
 
 #define SHUTTER_BUTTON_PIN GPIO_NUM_38
 #define MENU_BUTTON_PIN GPIO_NUM_39
-#define LED_PIN GPIO_NUM_39
 
 #define I2C_SDA_PIN GPIO_NUM_1
 #define I2C_SCL_PIN GPIO_NUM_2
@@ -108,7 +107,7 @@ typedef struct {
 #define ENCODER_DEBOUNCE_MS 200      // 値変化後のデバウンス時間(ms)
 #define ENCODER_POLL_INTERVAL_MS 50  // ポーリング間隔(ms)
 
-// 構造体定義など... (省略、元のファイルと同じ)
+// 構造体定義
 typedef struct
 {
     gpio_num_t pin;
@@ -143,8 +142,37 @@ typedef enum
     SYSTEM_STATUS_CAPTURING,
     SYSTEM_STATUS_SAVING,
     SYSTEM_STATUS_ERROR,
-    SYSTEM_MENU_MODE,
 } system_status_t;
+
+// メニュー項目定義（エンコーダの動作が変わる）
+typedef enum
+{
+    MENU_ITEM_PALETTE = 0, //カラーパレット変更(シャッターで撮影)
+    MENU_ITEM_RESOLUTION, //解像度変更(シャッターで決定)
+    MENU_ITEM_PHOTO_LIST, //撮影画像見る
+    MENU_ITEM_PALETTE_READ, //シャッターでSDカードからパレット読み込み
+    MENU_ITEM_USB, //シャッターでUSB MSCモード
+} menu_list_t;
+// 解像度項目定義
+typedef enum
+{
+    RESOLUTION_128x128 = 0,    //FRAMESIZE_128X128,2
+    RESOLUTION_176x144,    //FRAMESIZE_QCIF,   3
+    RESOLUTION_240x176,    //FRAMESIZE_HQVGA,  4
+    RESOLUTION_240x240,    //FRAMESIZE_240X240,5
+    RESOLUTION_320x240,    //FRAMESIZE_QVGA,   6
+    RESOLUTION_320x320,    //FRAMESIZE_320X320,7
+    RESOLUTION_400x296,    //FRAMESIZE_CIF,    8
+    RESOLUTION_480x320,    //FRAMESIZE_HVGA,   9
+    RESOLUTION_640x480,    //FRAMESIZE_VGA,    10
+} resolution_t;
+
+//メニュー用グローバル変数　最初はカラーパレットモード
+static menu_list_t g_current_menu = MENU_ITEM_PALETTE;
+// 現在選択中のパレット
+static volatile uint8_t g_current_palette_index = 0;
+// 現在選択中の解像度
+static volatile resolution_t g_current_resolution = RESOLUTION_240x240;
 
 // グローバル変数 - エンコーダーのみC構造体に変更
 static SemaphoreHandle_t g_capture_semaphore = NULL;
@@ -171,12 +199,8 @@ static button_state_t g_menu_button = {
     .long_press_triggered = false,
     .name = "Menu"};
 
-// 現在選択中のパレット
-static volatile int g_current_palette_index = 0;
 // 撮影画像ファイル連番
-static volatile int g_file_counter = 0;
-
-static volatile uint32_t g_last_button_press = 0;
+static volatile uint16_t g_file_counter = 0;
 
 // ハードウェアオブジェクト - エンコーダーのみC構造体に変更
 static pimoroni_encoder_t g_encoder;
@@ -191,7 +215,6 @@ static bool g_sd_card_ready = false;
 
 // システム状態管理
 static volatile system_status_t g_system_status = SYSTEM_STATUS_INITIALIZING;
-static volatile bool g_status_led_enabled = true;
 
 static sdmmc_card_t *g_sd_card = NULL;
 static const char *g_mount_point = "/sdcard";
@@ -232,14 +255,36 @@ static const uint32_t PALETTE_REP_COLORS[8] = {
 };
 
 static const char* PALETTE_NAMES[8] = {
-    "slso8",
-    "legend",
-    "famires",
-    "gothic",
-    "noire",
-    "demiboy",
+    "slso",
+    "lege",
+    "fami",
+    "goth",
+    "noir",
+    "demi",
     "maze",
-    "night"
+    "nigh"
+};
+
+// メニュー項目名（8文字以内、日本語）
+static const char* MENU_ITEM_NAMES[5] = {
+    "パレット",
+    "かいぞうど",
+    "しゃしん",
+    "SDよみこみ",
+    "USB MSC"
+};
+
+// 解像度項目名（8文字以内、日本語）
+static const char* RESOLUTION_NAMES[9] = {
+    "128SQ",
+    "QCIF",
+    "HQVGA",
+    "240SQ",
+    "QVGA",
+    "320SQ",
+    "CIF",
+    "HVGA",
+    "VGA",
 };
 
 // 関数プロトタイプ
@@ -249,6 +294,7 @@ void process_button_events(void);
 void encoder_task(void *parameter);
 void camera_preview_task(void *parameter);
 void histogram_task(void *parameter);
+void menu_display_task(void *parameter);
 void capture_task(void *parameter);
 esp_err_t init_sd_card(void);
 void print_sd_card_info(void);
@@ -413,18 +459,7 @@ esp_err_t init_gpio(void)
     if (ret != ESP_OK)
         return ret;
 
-    gpio_config_t led_config = {
-        .pin_bit_mask = (1ULL << LED_PIN),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE};
 
-    ret = gpio_config(&led_config);
-    if (ret != ESP_OK)
-        return ret;
-
-    gpio_set_level(LED_PIN, 0);
     return ESP_OK;
 }
 
@@ -585,12 +620,28 @@ void process_button_events(void)
     switch (shutter_event)
     {
     case BUTTON_EVENT_SHORT_PRESS:
-        ESP_LOGI(TAG, "📸 シャッター短押し: 選択中のパレットで撮影");
-        start_capture(false);  // 単一パレット撮影
+        // シャッター短押し: パレットモードの時のみ撮影可能
+        if (g_current_menu == MENU_ITEM_PALETTE)
+        {
+            ESP_LOGI(TAG, "📸 シャッター短押し: 選択中のパレットで撮影");
+            start_capture(false);  // 単一パレット撮影
+        }
+        else
+        {
+            ESP_LOGW(TAG, "⚠️ シャッター無効: パレットモード以外では撮影できません");
+        }
         break;
     case BUTTON_EVENT_LONG_PRESS:
-        ESP_LOGI(TAG, "📸 シャッター長押し: 全パレット撮影");
-        start_capture(true);   // 全パレット撮影
+        // シャッター長押し: パレットモードの時のみ撮影可能
+        if (g_current_menu == MENU_ITEM_PALETTE)
+        {
+            ESP_LOGI(TAG, "📸 シャッター長押し: 全パレット撮影");
+            start_capture(true);   // 全パレット撮影
+        }
+        else
+        {
+            ESP_LOGW(TAG, "⚠️ シャッター無効: パレットモード以外では撮影できません");
+        }
         break;
     default:
         break;
@@ -600,35 +651,24 @@ void process_button_events(void)
     switch (menu_event)
     {
     case BUTTON_EVENT_SHORT_PRESS:
-        ESP_LOGI(TAG, "🎨 メニュー短押し: LEDテスト実行");
-        if (g_encoder_ready)
+        // メニューボタン短押し: 次のメニュー項目へ移動
+        // USB MSCモードの場合はパレットモードに戻る
+        if (g_current_menu == MENU_ITEM_USB)
         {
-            ESP_LOGI(TAG, "🌈 RGB LEDテスト開始");
-            for (int i = 0; i < 8; i++)
-            {
-                uint32_t color = PALETTE_REP_COLORS[i];
-                uint8_t r = (color >> 16) & 0xFF;
-                uint8_t g = (color >> 8) & 0xFF;
-                uint8_t b = color & 0xFF;
-
-                pimoroni_encoder_set_led(&g_encoder, r, g, b);
-                vTaskDelay(pdMS_TO_TICKS(200));
-            }
-            uint32_t current_color = PALETTE_REP_COLORS[g_current_palette_index];
-            uint8_t r = (current_color >> 16) & 0xFF;
-            uint8_t g = (current_color >> 8) & 0xFF;
-            uint8_t b = current_color & 0xFF;
-            pimoroni_encoder_set_led(&g_encoder, r, g, b);
+            ESP_LOGI(TAG, "📋 USBモードからパレットモードへ戻る");
+            g_current_menu = MENU_ITEM_PALETTE;
+        }
+        else
+        {
+            // 次のメニュー項目へ（0→1→2→3→4→0の循環）
+            g_current_menu = (menu_list_t)((g_current_menu + 1) % 5);
+            ESP_LOGI(TAG, "📋 メニュー切り替え: %s", MENU_ITEM_NAMES[g_current_menu]);
         }
         break;
     case BUTTON_EVENT_LONG_PRESS:
-        ESP_LOGI(TAG, "ℹ️ メニュー長押し: システム情報表示");
-        ESP_LOGI(TAG, "=== システム情報 ===");
-        ESP_LOGI(TAG, "カメラ: %s", g_camera_ready ? "OK" : "NG");
-        ESP_LOGI(TAG, "エンコーダー: %s", g_encoder_ready ? "OK" : "NG");
-        ESP_LOGI(TAG, "ディスプレイ: %s", g_display_ready ? "OK" : "NG");
-        ESP_LOGI(TAG, "SDカード: %s", g_sd_card_ready ? "OK" : "NG");
-        ESP_LOGI(TAG, "現在のパレット: %d", g_current_palette_index);
+        // メニューボタン長押し: パレットモードに戻る
+        ESP_LOGI(TAG, "📋 メニュー長押し: パレットモードへ戻る");
+        g_current_menu = MENU_ITEM_PALETTE;
         break;
     default:
         break;
@@ -647,8 +687,9 @@ void encoder_task(void *parameter)
 
     while (1)
     {
-        if (g_encoder_ready && g_system_status == SYSTEM_STATUS_READY)
+        if (g_encoder_ready && g_system_status == SYSTEM_STATUS_READY && g_current_menu == MENU_ITEM_PALETTE)
         {
+            // パレットモードの時のみエンコーダーを処理
             // エンコーダー値を読み取り（新APIを使用）
             int16_t current_value = pimoroni_encoder_read(&g_encoder);
             uint32_t current_time = esp_timer_get_time() / 1000;
@@ -779,8 +820,8 @@ void camera_preview_task(void *parameter)
 
     while (1)
     {
-        // 撮影中または保存中はプレビューを停止
-        if (g_system_status != SYSTEM_STATUS_READY)
+        // 撮影中または保存中、またはパレットモード以外はプレビューを停止
+        if (g_system_status != SYSTEM_STATUS_READY || g_current_menu != MENU_ITEM_PALETTE)
         {
             vTaskDelay(pdMS_TO_TICKS(UPDATE_INTERVAL_MS));
             continue;
@@ -863,7 +904,7 @@ void camera_preview_task(void *parameter)
             // ディスプレイに描画（ミューテックス保護）
             if (g_display_mutex != NULL && xSemaphoreTake(g_display_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
             {
-                g_display->clear();
+                // clear()を呼ばない - プレビュー領域のみを更新して他の領域を保持
 
                 for (int y = 0; y < PREVIEW_SIZE; y++)
                 {
@@ -874,8 +915,7 @@ void camera_preview_task(void *parameter)
                     }
                 }
 
-                // display()はヒストグラムタスクに任せるため、ここでは呼ばない
-                // g_display->display();
+                // display()はメニュータスクに任せるため、ここでは呼ばない
 
                 xSemaphoreGive(g_display_mutex);
             }
@@ -916,8 +956,8 @@ void histogram_task(void *parameter)
 
     while (1)
     {
-        // 撮影中または保存中はヒストグラムを停止
-        if (g_system_status != SYSTEM_STATUS_READY)
+        // 撮影中または保存中、またはパレットモード以外はヒストグラムを停止
+        if (g_system_status != SYSTEM_STATUS_READY || g_current_menu != MENU_ITEM_PALETTE)
         {
             vTaskDelay(pdMS_TO_TICKS(UPDATE_INTERVAL_MS));
             continue;
@@ -1004,6 +1044,11 @@ void histogram_task(void *parameter)
                         int bar_y = GRAPH_Y + GRAPH_HEIGHT - 1 - h;  // 下から上へ
                         g_display->set_pixel(bar_x, bar_y, true);
                     }
+                    for (int h = bar_height; h < GRAPH_HEIGHT; h++)
+                    {
+                        int bar_y = GRAPH_Y + GRAPH_HEIGHT - 1 - h;
+                        g_display->set_pixel(bar_x, bar_y, false);
+                    }
                 }
 
                 // 白飛び警告表示
@@ -1023,8 +1068,7 @@ void histogram_task(void *parameter)
                              histogram[HISTOGRAM_BINS - 1], overexposed_percentage);
                 }
 
-                // 画面を更新（このタスクが最後に呼ぶ）
-                g_display->display();
+                // 画面更新はメニュータスクに任せる（display()を呼ばない）
 
                 xSemaphoreGive(g_display_mutex);
             }
@@ -1033,6 +1077,81 @@ void histogram_task(void *parameter)
         {
             // カメラまたはディスプレイが準備できていない
             vTaskDelay(pdMS_TO_TICKS(500));
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(UPDATE_INTERVAL_MS));
+    }
+}
+
+// メニュー表示タスク
+void menu_display_task(void *parameter)
+{
+    ESP_LOGI(TAG, "📋 メニュー表示タスク開始");
+
+    const int UPDATE_INTERVAL_MS = 200;  // 更新間隔
+
+    // メニュー用ターミナル作成（8文字×5行）
+    Terminal menu_terminal(8, 5);
+    menu_terminal.init();
+    menu_terminal.set_position(64, 0);  // 表示位置 (64, 0)
+    menu_terminal.set_border(false);     // 枠線なし
+    menu_terminal.set_auto_wrap(false);
+    menu_terminal.set_auto_scroll(false);
+
+    while (1)
+    {
+        // 常にメニューを表示（全モードで動作）
+        if (g_display_ready && g_display_mutex != NULL &&
+            xSemaphoreTake(g_display_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+        {
+            // パレットモード以外の時は画面をクリア
+            if (g_current_menu != MENU_ITEM_PALETTE)
+            {
+                g_display->clear();
+            }
+
+            // ターミナルをクリア
+            menu_terminal.clear();
+
+            // 各メニュー項目を表示
+            for (int i = 0; i < 5; i++)
+            {
+                // カーソル位置を設定
+                menu_terminal.set_cursor(i, 0);
+
+                // 選択中の項目には先頭に「>」を表示
+                if (i == g_current_menu)
+                {
+                    // 反転表示用に文字列を作成
+                    g_display->terminal_print(&menu_terminal, ">");
+                }
+                else
+                {
+                    g_display->terminal_print(&menu_terminal, " ");
+                }
+
+                // メニュー項目名を表示
+                g_display->terminal_print(&menu_terminal, MENU_ITEM_NAMES[i]);
+            }
+
+            // 選択中のパレット名を表示
+            g_display->draw_string(80, 40, PALETTE_NAMES[g_current_palette_index], true);
+            // 選択中の解像度名を表示
+            g_display->draw_string(80, 48, RESOLUTION_NAMES[g_current_resolution], true);
+            // SDカードの状態を表示
+            if (g_sd_card_mounted)
+            {
+                g_display->draw_string(80, 56, "SD: OK", true);
+            }
+            else
+            {
+                g_display->draw_string(80, 56, "SD: ERR", true);
+            }
+            // メニューを描画して画面を更新
+            g_display->draw_terminal(&menu_terminal);
+            g_display->display();
+
+            xSemaphoreGive(g_display_mutex);
         }
 
         vTaskDelay(pdMS_TO_TICKS(UPDATE_INTERVAL_MS));
@@ -1697,6 +1816,28 @@ extern "C" void app_main(void)
         else
         {
             ESP_LOGE(TAG, "❌ ヒストグラムタスク起動失敗");
+        }
+    }
+
+    // メニュー表示タスク開始
+    if (g_display_ready && g_display_mutex != NULL)
+    {
+        BaseType_t menu_task_result = xTaskCreate(
+            menu_display_task,
+            "menu_display",
+            4096,  // スタックサイズ
+            NULL,
+            tskIDLE_PRIORITY + 1,  // プレビューと同じ優先度
+            NULL
+        );
+
+        if (menu_task_result == pdPASS)
+        {
+            ESP_LOGI(TAG, "✅ メニュー表示タスク起動成功");
+        }
+        else
+        {
+            ESP_LOGE(TAG, "❌ メニュー表示タスク起動失敗");
         }
     }
 
