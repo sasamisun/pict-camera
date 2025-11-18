@@ -116,6 +116,7 @@ extern "C"
         float brightness;                       // LED明度（0.01-1.0）
         int16_t encoder_offset;                 // エンコーダーオフセット値
         int16_t encoder_last;                   // 前回のエンコーダー値
+        uint8_t encoder_raw_last;               // 前回の生の値（デバウンス用）
     } pimoroni_encoder_t;
 
     /**

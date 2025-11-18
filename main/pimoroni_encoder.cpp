@@ -330,6 +330,24 @@ esp_err_t pimoroni_encoder_init(pimoroni_encoder_t *encoder, const pimoroni_enco
     ret |= setup_pwm_system(encoder);
     ret |= enable_interrupt_output(encoder);
 
+    // エンコーダーの初期値を読み取って同期
+    if (ret == ESP_OK)
+    {
+        uint8_t initial_count;
+        ret = read_register(encoder, REG_ENC_1_COUNT, &initial_count);
+        if (ret == ESP_OK)
+        {
+            encoder->encoder_last = (int16_t)((int8_t)initial_count);
+            encoder->encoder_raw_last = initial_count;
+            ESP_LOGI(TAG, "エンコーダー初期値同期: %d (raw=0x%02X)", encoder->encoder_last, initial_count);
+        }
+        else
+        {
+            ESP_LOGW(TAG, "エンコーダー初期値読み取り失敗、デフォルト値0を使用");
+            encoder->encoder_raw_last = 0;
+        }
+    }
+
     if (ret == ESP_OK)
     {
         ESP_LOGI(TAG, "Pimoroni Encoder初期化完了 (I2C=0x%02X)", encoder->i2c_address);
@@ -378,18 +396,46 @@ int16_t pimoroni_encoder_read(pimoroni_encoder_t *encoder)
         return encoder->encoder_offset + encoder->encoder_last;
     }
 
+    // デバウンスフィルタ: 前回と同じ生の値の場合は値を更新しない
+    if (raw_count == encoder->encoder_raw_last)
+    {
+        // 値が変化していないので前回の結果を返す
+        int16_t total_count = encoder->encoder_offset + encoder->encoder_last;
+        if (encoder->direction == PIMORONI_ENCODER_CCW)
+        {
+            total_count = -total_count;
+        }
+        ESP_LOGD(TAG, "[デバウンス] raw=0x%02X (変化なし) → total=%d", raw_count, total_count);
+        return total_count;
+    }
+
+    // 生の値を保存（次回のデバウンス判定用）
+    encoder->encoder_raw_last = raw_count;
+
     // 符号付き8ビット値に変換
     int16_t current_count = (int16_t)((int8_t)raw_count);
 
-    // オーバーフロー/アンダーフロー検出・補正
+    ESP_LOGI(TAG, "[読取] raw=0x%02X → current=%d, last=%d", raw_count, current_count, encoder->encoder_last);
+
+    // オーバーフロー/アンダーフロー検出・補正（差分ベース方式）
     int16_t last = encoder->encoder_last;
-    if (last > 64 && current_count < -64)
+    int16_t diff = current_count - last;
+
+    ESP_LOGI(TAG, "[差分] diff=%d (current=%d - last=%d)", diff, current_count, last);
+
+    // 差分が大きすぎる場合は8ビットラップアラウンドが発生したと判定
+    // 正常な回転では差分は-20～+20程度のはず
+    if (diff > 200)
     {
-        encoder->encoder_offset += 256; // 正方向オーバーフロー
-    }
-    else if (last < -64 && current_count > 64)
-    {
+        // 例: last=-100, current=120 → diff=220 → 実際は負方向に回転して-100→-128→127→120
         encoder->encoder_offset -= 256; // 負方向アンダーフロー
+        ESP_LOGW(TAG, "[ラップ検出] 負方向アンダーフロー: diff=%d → offset=%d", diff, encoder->encoder_offset);
+    }
+    else if (diff < -200)
+    {
+        // 例: last=120, current=-100 → diff=-220 → 実際は正方向に回転して120→127→-128→-100
+        encoder->encoder_offset += 256; // 正方向オーバーフロー
+        ESP_LOGW(TAG, "[ラップ検出] 正方向オーバーフロー: diff=%d → offset=%d", diff, encoder->encoder_offset);
     }
 
     encoder->encoder_last = current_count;
@@ -397,11 +443,16 @@ int16_t pimoroni_encoder_read(pimoroni_encoder_t *encoder)
     // 最終カウント値計算
     int16_t total_count = encoder->encoder_offset + current_count;
 
+    ESP_LOGI(TAG, "[計算] offset=%d + current=%d = total=%d", encoder->encoder_offset, current_count, total_count);
+
     // 回転方向を考慮
     if (encoder->direction == PIMORONI_ENCODER_CCW)
     {
         total_count = -total_count;
+        ESP_LOGI(TAG, "[方向] CCW補正後 → total=%d", total_count);
     }
+
+    ESP_LOGI(TAG, "[結果] 最終値 = %d\n", total_count);
 
     return total_count;
 }

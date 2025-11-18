@@ -97,6 +97,7 @@ typedef struct {
 
 #define DEBOUNCE_DELAY_MS 300
 #define MAX_PALETTE_INDEX 8
+#define MAX_RESOLUTION_INDEX 9
 #define IMAGE_WIDTH 240
 #define IMAGE_HEIGHT 176
 #define CAPTURE_TASK_STACK 8192
@@ -104,8 +105,8 @@ typedef struct {
 #define ENCODER_TASK_STACK 4096
 
 // エンコーダーチャタリング対策設定
-#define ENCODER_DEBOUNCE_MS 200      // 値変化後のデバウンス時間(ms)
-#define ENCODER_POLL_INTERVAL_MS 50  // ポーリング間隔(ms)
+#define ENCODER_DEBOUNCE_MS 50      // 値変化後のデバウンス時間(ms)
+#define ENCODER_POLL_INTERVAL_MS 10  // ポーリング間隔(ms)
 
 // 構造体定義
 typedef struct
@@ -687,17 +688,35 @@ void encoder_task(void *parameter)
 
     while (1)
     {
-        if (g_encoder_ready && g_system_status == SYSTEM_STATUS_READY && g_current_menu == MENU_ITEM_PALETTE)
+        if (g_encoder_ready && g_system_status == SYSTEM_STATUS_READY)
         {
-            // パレットモードの時のみエンコーダーを処理
             // エンコーダー値を読み取り（新APIを使用）
             int16_t current_value = pimoroni_encoder_read(&g_encoder);
             uint32_t current_time = esp_timer_get_time() / 1000;
 
-            // 値をパレットインデックス範囲に制限
-            current_value = current_value % MAX_PALETTE_INDEX;
-            if (current_value < 0)
-                current_value += MAX_PALETTE_INDEX;
+            //ESP_LOGI(TAG, "🔄(%d)", current_value);
+
+            // モードに応じて値の範囲を制限
+            if (g_current_menu == MENU_ITEM_PALETTE)
+            {
+                // パレットモード: 0-7の範囲
+                current_value = current_value % MAX_PALETTE_INDEX;
+                if (current_value < 0)
+                    current_value += MAX_PALETTE_INDEX;
+            }
+            else if (g_current_menu == MENU_ITEM_RESOLUTION)
+            {
+                // 解像度モード: 0-8の範囲
+                current_value = current_value % MAX_RESOLUTION_INDEX;
+                if (current_value < 0)
+                    current_value += MAX_RESOLUTION_INDEX;
+            }
+            else
+            {
+                // その他のモード: エンコーダー無効
+                vTaskDelay(pdMS_TO_TICKS(500));
+                continue;
+            }
 
             // チャタリング対策: デバウンス時間をチェック
             uint32_t time_since_last_change = current_time - last_change_time;
@@ -716,55 +735,34 @@ void encoder_task(void *parameter)
                     ESP_LOGI(TAG, "🔄 エンコーダー値変更: %d → %d (Δ%d)",
                              last_encoder_value, current_value, delta);
 
-                    // パレットインデックスを更新
-                    g_current_palette_index = current_value;
-
-                    // LEDの色を変更（新APIを使用）
-                    uint32_t color = PALETTE_REP_COLORS[current_value];
-                    uint8_t r = (color >> 16) & 0xFF;
-                    uint8_t g = (color >> 8) & 0xFF;
-                    uint8_t b = color & 0xFF;
-
-                    esp_err_t led_result = pimoroni_encoder_set_led(&g_encoder, r, g, b);
-
-                    if (led_result == ESP_OK)
+                    // モード別の処理
+                    if (g_current_menu == MENU_ITEM_PALETTE)
                     {
-                        ESP_LOGI(TAG, "🎨 LED色変更成功: パレット%d → RGB(%d,%d,%d)",
-                                 current_value, r, g, b);
+                        // パレットモード: パレットインデックスを更新
+                        g_current_palette_index = current_value;
+
+                        // LEDの色を変更（新APIを使用）
+                        uint32_t color = PALETTE_REP_COLORS[current_value];
+                        uint8_t r = (color >> 16) & 0xFF;
+                        uint8_t g = (color >> 8) & 0xFF;
+                        uint8_t b = color & 0xFF;
+
+                        esp_err_t led_result = pimoroni_encoder_set_led(&g_encoder, r, g, b);
+
+                        if (led_result == ESP_OK)
+                        {
+                            ESP_LOGI(TAG, "🎨 パレット変更: %s", PALETTE_NAMES[current_value]);
+                        }
+                        else
+                        {
+                            ESP_LOGW(TAG, "LED色変更失敗: %s", esp_err_to_name(led_result));
+                        }
                     }
-                    else
+                    else if (g_current_menu == MENU_ITEM_RESOLUTION)
                     {
-                        ESP_LOGW(TAG, "LED色変更失敗: %s", esp_err_to_name(led_result));
-                    }
-
-                    // ディスプレイを更新（簡単なステータス表示）
-                    if (g_display_ready && (current_time - last_update_time) > 100)
-                    {
-                        g_display->clear();
-
-                        // パレット番号を表示（簡単なパターンで）
-                        int palette_dots = current_value + 1;
-                        for (int i = 0; i < palette_dots && i < 8; i++)
-                        {
-                            g_display->set_pixel(10 + i * 8, 10, true);
-                        }
-
-                        // RGB値を簡単なバーで表示
-                        for (int i = 0; i < r / 8 && i < 32; i++)
-                        {
-                            g_display->set_pixel(10 + i, 25, true); // R
-                        }
-                        for (int i = 0; i < g / 8 && i < 32; i++)
-                        {
-                            g_display->set_pixel(10 + i, 35, true); // G
-                        }
-                        for (int i = 0; i < b / 8 && i < 32; i++)
-                        {
-                            g_display->set_pixel(10 + i, 45, true); // B
-                        }
-
-                        g_display->display();
-                        last_update_time = current_time;
+                        // 解像度モード: 解像度を更新
+                        g_current_resolution = (resolution_t)current_value;
+                        ESP_LOGI(TAG, "📐 解像度変更: %s", RESOLUTION_NAMES[current_value]);
                     }
 
                     // エンコーダーイベントをキューに送信
