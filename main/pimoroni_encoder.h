@@ -117,6 +117,7 @@ extern "C"
         int16_t encoder_offset;                 // エンコーダーオフセット値
         int16_t encoder_last;                   // 前回のエンコーダー値
         uint8_t encoder_raw_last;               // 前回の生の値（デバウンス用）
+        int8_t encoder_accumulator;             // 累積カウンタ（±1の変化を蓄積）
     } pimoroni_encoder_t;
 
     /**

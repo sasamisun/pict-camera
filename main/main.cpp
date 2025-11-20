@@ -105,8 +105,8 @@ typedef struct {
 #define ENCODER_TASK_STACK 4096
 
 // エンコーダーチャタリング対策設定
-#define ENCODER_DEBOUNCE_MS 50      // 値変化後のデバウンス時間(ms)
-#define ENCODER_POLL_INTERVAL_MS 10  // ポーリング間隔(ms)
+#define ENCODER_DEBOUNCE_MS 100     // 値変化後のデバウンス時間(ms) - 振動吸収のため延長
+#define ENCODER_POLL_INTERVAL_MS 20  // ポーリング間隔(ms) - ノイズ対策で延長
 
 // 構造体定義
 typedef struct
@@ -664,16 +664,43 @@ void process_button_events(void)
             // 次のメニュー項目へ（0→1→2→3→4→0の循環）
             g_current_menu = (menu_list_t)((g_current_menu + 1) % 5);
             ESP_LOGI(TAG, "📋 メニュー切り替え: %s", MENU_ITEM_NAMES[g_current_menu]);
+
+            // エンコーダ値をクリアして負の値の累積を防止
+            if (g_encoder_ready)
+            {
+                pimoroni_encoder_clear(&g_encoder);
+                ESP_LOGD(TAG, "エンコーダークリア実行");
+            }
         }
         break;
     case BUTTON_EVENT_LONG_PRESS:
         // メニューボタン長押し: パレットモードに戻る
         ESP_LOGI(TAG, "📋 メニュー長押し: パレットモードへ戻る");
         g_current_menu = MENU_ITEM_PALETTE;
+
+        // エンコーダ値をクリア
+        if (g_encoder_ready)
+        {
+            pimoroni_encoder_clear(&g_encoder);
+            ESP_LOGD(TAG, "エンコーダークリア実行");
+        }
         break;
     default:
         break;
     }
+}
+
+/**
+ * @brief 安全なmodulo演算（常に正の結果を返す）
+ *
+ * 負の値でも正しく0～modulus-1の範囲に収める
+ * 例: safe_modulo(-23, 8) = 1
+ *     safe_modulo(-1, 8) = 7
+ *     safe_modulo(9, 8) = 1
+ */
+static inline int16_t safe_modulo(int16_t value, int16_t modulus)
+{
+    return ((value % modulus) + modulus) % modulus;
 }
 
 // ★★★ チャタリング対策を追加したエンコーダータスク ★★★
@@ -696,20 +723,16 @@ void encoder_task(void *parameter)
 
             //ESP_LOGI(TAG, "🔄(%d)", current_value);
 
-            // モードに応じて値の範囲を制限
+            // モードに応じて値の範囲を制限（safe_modulo使用で負の値も正しく処理）
             if (g_current_menu == MENU_ITEM_PALETTE)
             {
                 // パレットモード: 0-7の範囲
-                current_value = current_value % MAX_PALETTE_INDEX;
-                if (current_value < 0)
-                    current_value += MAX_PALETTE_INDEX;
+                current_value = safe_modulo(current_value, MAX_PALETTE_INDEX);
             }
             else if (g_current_menu == MENU_ITEM_RESOLUTION)
             {
                 // 解像度モード: 0-8の範囲
-                current_value = current_value % MAX_RESOLUTION_INDEX;
-                if (current_value < 0)
-                    current_value += MAX_RESOLUTION_INDEX;
+                current_value = safe_modulo(current_value, MAX_RESOLUTION_INDEX);
             }
             else
             {
@@ -728,6 +751,9 @@ void encoder_task(void *parameter)
                 if (time_since_last_change >= ENCODER_DEBOUNCE_MS)
                 {
                     int16_t delta = current_value - last_encoder_value;
+
+                    // ヒステリシスフィルタを削除し、全ての変化を処理
+                    // デバウンス時間（100ms）での吸収に任せる
 
                     // 最後の変化時刻を更新
                     last_change_time = current_time;
@@ -1730,7 +1756,7 @@ extern "C" void app_main(void)
     display_init_step(&terminal, " Encoder init");
     pimoroni_encoder_config_t encoder_config = pimoroni_encoder_get_default_config(EXTERNAL_I2C_NUM);
     encoder_config.i2c_address = PIMORONI_ENCODER_I2C_ADDR;
-    encoder_config.direction = PIMORONI_ENCODER_CW;
+    encoder_config.direction = PIMORONI_ENCODER_CCW; // 修正: ハードウェアの実際の回転方向に合わせて反転
     encoder_config.brightness = 1.0f;
     encoder_config.interrupt_pin = GPIO_NUM_NC;
     encoder_config.skip_chip_id_check = false;
