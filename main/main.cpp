@@ -20,6 +20,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "esp_heap_caps.h"
 #include "esp_chip_info.h"
 #include "esp_random.h"
@@ -104,9 +105,13 @@ typedef struct {
 #define PROCESS_TASK_STACK 16384
 #define ENCODER_TASK_STACK 4096
 
-// エンコーダーチャタリング対策設定
-#define ENCODER_DEBOUNCE_MS 100     // 値変化後のデバウンス時間(ms) - 振動吸収のため延長
-#define ENCODER_POLL_INTERVAL_MS 20  // ポーリング間隔(ms) - ノイズ対策で延長
+// NVS設定
+#define NVS_NAMESPACE "pict_camera"
+#define NVS_KEY_PALETTE "palette_idx"
+#define NVS_KEY_RESOLUTION "resolution"
+
+// 注: エンコーダーのフィルタリング・デバウンス設定はドライバ内部に移行しました
+// (pimoroni_encoder.cpp参照)
 
 // 構造体定義
 typedef struct
@@ -148,12 +153,15 @@ typedef enum
 // メニュー項目定義（エンコーダの動作が変わる）
 typedef enum
 {
-    MENU_ITEM_PALETTE = 0, //カラーパレット変更(シャッターで撮影)
+    MENU_ITEM_CAPTURE = 0, //撮影モード(シャッターで撮影、メニュー非表示)
+    MENU_ITEM_PALETTE, //カラーパレット変更
     MENU_ITEM_RESOLUTION, //解像度変更(シャッターで決定)
     MENU_ITEM_PHOTO_LIST, //撮影画像見る
     MENU_ITEM_PALETTE_READ, //シャッターでSDカードからパレット読み込み
     MENU_ITEM_USB, //シャッターでUSB MSCモード
 } menu_list_t;
+
+// 注: MENU_ITEM_CAPTUREはメニューに表示されない特殊なモード
 // 解像度項目定義
 typedef enum
 {
@@ -168,8 +176,21 @@ typedef enum
     RESOLUTION_640x480,    //FRAMESIZE_VGA,    10
 } resolution_t;
 
-//メニュー用グローバル変数　最初はカラーパレットモード
-static menu_list_t g_current_menu = MENU_ITEM_PALETTE;
+// 解像度→framesize_t変換テーブル
+static const framesize_t RESOLUTION_TO_FRAMESIZE[9] = {
+    FRAMESIZE_128X128,   // RESOLUTION_128x128
+    FRAMESIZE_QCIF,      // RESOLUTION_176x144
+    FRAMESIZE_HQVGA,     // RESOLUTION_240x176
+    FRAMESIZE_240X240,   // RESOLUTION_240x240
+    FRAMESIZE_QVGA,      // RESOLUTION_320x240
+    FRAMESIZE_320X320,   // RESOLUTION_320x320
+    FRAMESIZE_CIF,       // RESOLUTION_400x296
+    FRAMESIZE_HVGA,      // RESOLUTION_480x320
+    FRAMESIZE_VGA,       // RESOLUTION_640x480
+};
+
+//メニュー用グローバル変数　最初は撮影モード
+static menu_list_t g_current_menu = MENU_ITEM_CAPTURE;
 // 現在選択中のパレット
 static volatile uint8_t g_current_palette_index = 0;
 // 現在選択中の解像度
@@ -224,7 +245,7 @@ static bool g_sd_card_mounted = false;
 // ========================================
 // カラーパレット定義（8種類×8色）
 // ========================================
-static const uint32_t COLOR_PALETTES[8][8] = {
+static const uint32_t COLOR_PALETTES_8[8][8] = {
   { // パレット0 slso8
     0x0D2B45, 0x203C56, 0x544E68, 0x8D697A, 0xD08159, 0xFFAA5E, 0xFFD4A3, 0xFFECD6 },
   { // パレット1 都市伝説解体センター風
@@ -241,6 +262,37 @@ static const uint32_t COLOR_PALETTES[8][8] = {
     0x001D2A, 0x085562, 0x009A98, 0x00BE91, 0x38D88E, 0x9AF089, 0xF2FF66, 0xF2FF66 },
   { // パレット7 night-rain
     0x000000, 0x012036, 0x3A7BAA, 0x7D8FAE, 0xA1B4C1, 0xF0B9B9, 0xFFD159, 0xFFFFFF },
+};
+
+// ========================================
+// カラーパレット定義（8種類×16色）
+// 8色パレットの各テーマを16色に拡張
+// ========================================
+static const uint32_t COLOR_PALETTES_16[8][16] = {
+  { // パレット0 slso8 (16色版)
+    0x071622, 0x0D2B45, 0x17334F, 0x203C56, 0x3C4560, 0x544E68, 0x6E5C71, 0x8D697A,
+    0xAB7969, 0xD08159, 0xE7954D, 0xFFAA5E, 0xFFBE80, 0xFFD4A3, 0xFFE3C0, 0xFFECD6 },
+  { // パレット1 都市伝説解体センター風 (16色版)
+    0x000000, 0x000611, 0x000B22, 0x091B33, 0x112B43, 0x295168, 0x437290, 0x5A8BA9,
+    0x84A9BD, 0xA1BFD0, 0xB8D0DC, 0xD0DBDF, 0xE0D8D1, 0xE8E0DA, 0xF4ECE8, 0xFFFFFF },
+  { // パレット2 ファミレスを享受せよ風 (16色版)
+    0x010101, 0x1A3350, 0x264D7F, 0x33669F, 0x3D78AD, 0x498DB7, 0x5C9EC4, 0x71AFD0,
+    0x8BC6E1, 0xA8D7EC, 0xC5E5F4, 0xD9EEFB, 0xE5D35E, 0xF0DC6B, 0xFBE379, 0xFFEE9E },
+  { // パレット3 gothic-bit (16色版)
+    0x07070A, 0x0E0E12, 0x14141B, 0x1A1A24, 0x26262F, 0x333346, 0x434359, 0x535373,
+    0x696989, 0x8080A4, 0x9393B2, 0xA6A6BF, 0xB4B4C9, 0xC1C1D2, 0xD4D4E0, 0xE6E6EC },
+  { // パレット4 noire-truth (16色版)
+    0x0F0D19, 0x1E1C32, 0x2D2A4B, 0x3C3964, 0x4E4877, 0x60588A, 0x766F9D, 0x8D86B0,
+    0x9F99BB, 0xB3ADC4, 0xC6BAAC, 0xCEC3B5, 0xD6CCBE, 0xDED5C7, 0xE6DDD0, 0xEEE6D9 },
+  { // パレット5 2BIT DEMIBOY (16色版)
+    0x121212, 0x252525, 0x383837, 0x4B4B49, 0x3D4239, 0x4B564D, 0x6D7961, 0x8A9470,
+    0x9AA57C, 0xABB58E, 0xBCC5A0, 0xCDD5B2, 0xD4DEB8, 0xDDE7C0, 0xE0E9C4, 0xEDF4DC },
+  { // パレット6 deep-maze (16色版)
+    0x000E15, 0x001D2A, 0x043B46, 0x085562, 0x00777D, 0x009A98, 0x00AAAA, 0x00BE91,
+    0x1ECB8F, 0x38D88E, 0x69E18D, 0x9AF089, 0xC8F67A, 0xDDFA6E, 0xF2FF66, 0xF8FF99 },
+  { // パレット7 night-rain (16色版)
+    0x000000, 0x01101B, 0x012036, 0x1D3A5A, 0x2E5478, 0x3A7BAA, 0x5988B5, 0x7D8FAE,
+    0x8F9FB9, 0xA1B4C1, 0xB8C4CE, 0xD4CFD0, 0xE2D4D4, 0xF0B9B9, 0xFFD159, 0xFFFFFF },
 };
 
 
@@ -266,7 +318,20 @@ static const char* PALETTE_NAMES[8] = {
     "nigh"
 };
 
+// パレット説明文（カメラプレビュー領域に表示）
+static const char* PALETTE_DESCRIPTIONS[8] = {
+    "slso8\nあたたかみの\nあるいろ",
+    "としでんせつ\nかいたい\nセンター",
+    "ファミレスを\nきょうじゅ\nせよ",
+    "gothic-bit\nモノクロ\nちっく",
+    "noire-truth\nしろくろ\n2しょく",
+    "2BIT DEMIBOY\nしぜんな\nみどり",
+    "deep-maze\nあかるい\nグラデ",
+    "night-rain\nよぞらと\nゆうひ"
+};
+
 // メニュー項目名（8文字以内、日本語）
+// 注: MENU_ITEM_CAPTURE(0)はメニューに表示されないため、インデックス1から開始
 static const char* MENU_ITEM_NAMES[5] = {
     "パレット",
     "かいぞうど",
@@ -288,6 +353,32 @@ static const char* RESOLUTION_NAMES[9] = {
     "VGA",
 };
 
+// 解像度の実際の寸法（幅、高さ）
+static const int RESOLUTION_DIMENSIONS[9][2] = {
+    {128, 128},  // RESOLUTION_128x128
+    {176, 144},  // RESOLUTION_176x144 (QCIF)
+    {240, 176},  // RESOLUTION_240x176 (HQVGA)
+    {240, 240},  // RESOLUTION_240x240
+    {320, 240},  // RESOLUTION_320x240 (QVGA)
+    {320, 320},  // RESOLUTION_320x320
+    {400, 296},  // RESOLUTION_400x296 (CIF)
+    {480, 320},  // RESOLUTION_480x320 (HVGA)
+    {640, 480},  // RESOLUTION_640x480 (VGA)
+};
+
+// 解像度説明文（カメラプレビュー領域に表示）
+static const char* RESOLUTION_DESCRIPTIONS[9] = {
+    "128x128\nせいほうけい\nちいさめ",
+    "176x144\nQCIF\nよこなが",
+    "240x176\nHQVGA\nよこなが",
+    "240x240\nせいほうけい\nちゅうがた",
+    "320x240\nQVGA\nよこなが",
+    "320x320\nせいほうけい\nおおがた",
+    "400x296\nCIF\nよこなが",
+    "480x320\nHVGA\nよこなが",
+    "640x480\nVGA\nひょうじゅん"
+};
+
 // 関数プロトタイプ
 void update_button_state(button_state_t *button);
 button_event_t get_button_event(button_state_t *button);
@@ -307,10 +398,12 @@ void display_init_step(Terminal *terminal, bool success);
 void run_display_test_patterns(void);
 void init_file_counter_from_sd(void);
 void generate_random_string(char* buf, int len);
-void apply_palette_reduction(uint8_t* rgb_data, int width, int height, int palette_idx);
+void apply_palette_reduction(uint8_t* rgb_data, int width, int height, int palette_idx, int color_count);
 esp_err_t save_rgb_as_bmp(uint8_t* rgb_data, int width, int height, const char* filepath);
 void draw_progress_bar(float progress, const char* status_text = nullptr);
 void start_capture(bool all_palettes);
+static void load_settings_from_nvs(void);
+static void save_settings_to_nvs(void);
 
 // ★★★ 初期化ステップ表示ヘルパー関数 ★★★
 void display_init_step(Terminal *terminal, const char *step_name)
@@ -538,7 +631,7 @@ void print_sd_card_info(void)
 }
 
 
-// ボタン処理関数群（省略、元のファイルと同じ）
+// ボタン処理関数群
 void update_button_state(button_state_t *button)
 {
     bool current_gpio_state = gpio_get_level(button->pin) == 0;
@@ -621,27 +714,51 @@ void process_button_events(void)
     switch (shutter_event)
     {
     case BUTTON_EVENT_SHORT_PRESS:
-        // シャッター短押し: パレットモードの時のみ撮影可能
-        if (g_current_menu == MENU_ITEM_PALETTE)
+        if (g_current_menu == MENU_ITEM_CAPTURE)
         {
+            // 撮影モード: 単一パレット撮影
             ESP_LOGI(TAG, "📸 シャッター短押し: 選択中のパレットで撮影");
-            start_capture(false);  // 単一パレット撮影
+            start_capture(false);
+        }
+        else if (g_current_menu == MENU_ITEM_PALETTE)
+        {
+            // パレットモード: 次のパレットに変更（0-7の循環）
+            g_current_palette_index = (g_current_palette_index + 1) % MAX_PALETTE_INDEX;
+            ESP_LOGI(TAG, "🎨 パレット変更: %s (index: %d)",
+                     PALETTE_NAMES[g_current_palette_index], g_current_palette_index);
+
+            // エンコーダーLEDの色も変更
+            if (g_encoder_ready)
+            {
+                uint32_t color = PALETTE_REP_COLORS[g_current_palette_index];
+                uint8_t r = (color >> 16) & 0xFF;
+                uint8_t g = (color >> 8) & 0xFF;
+                uint8_t b = color & 0xFF;
+                pimoroni_encoder_set_led(&g_encoder, r, g, b);
+            }
+        }
+        else if (g_current_menu == MENU_ITEM_RESOLUTION)
+        {
+            // 解像度モード: 次の解像度に変更（0-8の循環）
+            g_current_resolution = (resolution_t)((g_current_resolution + 1) % MAX_RESOLUTION_INDEX);
+            ESP_LOGI(TAG, "📐 解像度変更: %s (index: %d)",
+                     RESOLUTION_NAMES[g_current_resolution], g_current_resolution);
         }
         else
         {
-            ESP_LOGW(TAG, "⚠️ シャッター無効: パレットモード以外では撮影できません");
+            ESP_LOGD(TAG, "⚠️ シャッター短押し: このモードでは機能なし");
         }
         break;
     case BUTTON_EVENT_LONG_PRESS:
-        // シャッター長押し: パレットモードの時のみ撮影可能
-        if (g_current_menu == MENU_ITEM_PALETTE)
+        if (g_current_menu == MENU_ITEM_CAPTURE)
         {
+            // 撮影モード: 全パレット撮影
             ESP_LOGI(TAG, "📸 シャッター長押し: 全パレット撮影");
-            start_capture(true);   // 全パレット撮影
+            start_capture(true);
         }
         else
         {
-            ESP_LOGW(TAG, "⚠️ シャッター無効: パレットモード以外では撮影できません");
+            ESP_LOGD(TAG, "⚠️ シャッター長押し: このモードでは機能なし");
         }
         break;
     default:
@@ -652,31 +769,38 @@ void process_button_events(void)
     switch (menu_event)
     {
     case BUTTON_EVENT_SHORT_PRESS:
-        // メニューボタン短押し: 次のメニュー項目へ移動
-        // USB MSCモードの場合はパレットモードに戻る
-        if (g_current_menu == MENU_ITEM_USB)
+        if (g_current_menu == MENU_ITEM_CAPTURE)
         {
-            ESP_LOGI(TAG, "📋 USBモードからパレットモードへ戻る");
+            // 撮影モードの場合: メニューモード（パレット）に切り替え
+            ESP_LOGI(TAG, "📋 撮影モード→メニューモード（パレット）");
             g_current_menu = MENU_ITEM_PALETTE;
+        }
+        else if (g_current_menu == MENU_ITEM_USB)
+        {
+            // USBモードの場合: 撮影モードに戻る
+            ESP_LOGI(TAG, "📋 USBモードから撮影モードへ戻る");
+            g_current_menu = MENU_ITEM_CAPTURE;
+            save_settings_to_nvs();
         }
         else
         {
-            // 次のメニュー項目へ（0→1→2→3→4→0の循環）
-            g_current_menu = (menu_list_t)((g_current_menu + 1) % 5);
-            ESP_LOGI(TAG, "📋 メニュー切り替え: %s", MENU_ITEM_NAMES[g_current_menu]);
+            // メニューモード内での移動: 次のメニュー項目へ（1→2→3→4→5→1の循環）
+            g_current_menu = (menu_list_t)((g_current_menu == MENU_ITEM_USB) ? MENU_ITEM_PALETTE : (g_current_menu + 1));
+            ESP_LOGI(TAG, "📋 メニュー切り替え: %s", MENU_ITEM_NAMES[g_current_menu - 1]);
+        }
 
-            // エンコーダ値をクリアして負の値の累積を防止
-            if (g_encoder_ready)
-            {
-                pimoroni_encoder_clear(&g_encoder);
-                ESP_LOGD(TAG, "エンコーダークリア実行");
-            }
+        // エンコーダ値をクリアして負の値の累積を防止
+        if (g_encoder_ready)
+        {
+            pimoroni_encoder_clear(&g_encoder);
+            ESP_LOGD(TAG, "エンコーダークリア実行");
         }
         break;
     case BUTTON_EVENT_LONG_PRESS:
-        // メニューボタン長押し: パレットモードに戻る
-        ESP_LOGI(TAG, "📋 メニュー長押し: パレットモードへ戻る");
-        g_current_menu = MENU_ITEM_PALETTE;
+        // メニューボタン長押し: 常に撮影モードに戻る
+        ESP_LOGI(TAG, "📋 メニュー長押し: 撮影モードへ戻る");
+        g_current_menu = MENU_ITEM_CAPTURE;
+        save_settings_to_nvs();
 
         // エンコーダ値をクリア
         if (g_encoder_ready)
@@ -706,122 +830,30 @@ static inline int16_t safe_modulo(int16_t value, int16_t modulus)
 // ★★★ チャタリング対策を追加したエンコーダータスク ★★★
 void encoder_task(void *parameter)
 {
-    ESP_LOGI(TAG, "🔄 エンコーダータスク開始（デバウンス: %dms, ポーリング: %dms）",
-             ENCODER_DEBOUNCE_MS, ENCODER_POLL_INTERVAL_MS);
+    ESP_LOGI(TAG, "🔄 エンコーダータスク開始（ドライバ内部でフィルタリング済み）");
 
     int16_t last_encoder_value = 0;
-    uint32_t last_update_time = 0;
-    uint32_t last_change_time = 0;  // チャタリング対策用: 最後に値が変化した時刻
 
     while (1)
     {
         if (g_encoder_ready && g_system_status == SYSTEM_STATUS_READY)
         {
-            // エンコーダー値を読み取り（新APIを使用）
-            int16_t current_value = pimoroni_encoder_read(&g_encoder);
+            // ドライバから安定した値を取得（フィルタリング・デバウンス済み）
+            int16_t current_value = pimoroni_encoder_get_value(&g_encoder);
             uint32_t current_time = esp_timer_get_time() / 1000;
 
-            //ESP_LOGI(TAG, "🔄(%d)", current_value);
-
-            // モードに応じて値の範囲を制限（safe_modulo使用で負の値も正しく処理）
-            if (g_current_menu == MENU_ITEM_PALETTE)
-            {
-                // パレットモード: 0-7の範囲
-                current_value = safe_modulo(current_value, MAX_PALETTE_INDEX);
-            }
-            else if (g_current_menu == MENU_ITEM_RESOLUTION)
-            {
-                // 解像度モード: 0-8の範囲
-                current_value = safe_modulo(current_value, MAX_RESOLUTION_INDEX);
-            }
-            else
-            {
-                // その他のモード: エンコーダー無効
-                vTaskDelay(pdMS_TO_TICKS(500));
-                continue;
-            }
-
-            // チャタリング対策: デバウンス時間をチェック
-            uint32_t time_since_last_change = current_time - last_change_time;
-
-            // 値が変化した場合の処理
-            if (current_value != last_encoder_value)
-            {
-                // デバウンス時間が経過している場合のみ処理
-                if (time_since_last_change >= ENCODER_DEBOUNCE_MS)
-                {
-                    int16_t delta = current_value - last_encoder_value;
-
-                    // ヒステリシスフィルタを削除し、全ての変化を処理
-                    // デバウンス時間（100ms）での吸収に任せる
-
-                    // 最後の変化時刻を更新
-                    last_change_time = current_time;
-
-                    ESP_LOGI(TAG, "🔄 エンコーダー値変更: %d → %d (Δ%d)",
-                             last_encoder_value, current_value, delta);
-
-                    // モード別の処理
-                    if (g_current_menu == MENU_ITEM_PALETTE)
-                    {
-                        // パレットモード: パレットインデックスを更新
-                        g_current_palette_index = current_value;
-
-                        // LEDの色を変更（新APIを使用）
-                        uint32_t color = PALETTE_REP_COLORS[current_value];
-                        uint8_t r = (color >> 16) & 0xFF;
-                        uint8_t g = (color >> 8) & 0xFF;
-                        uint8_t b = color & 0xFF;
-
-                        esp_err_t led_result = pimoroni_encoder_set_led(&g_encoder, r, g, b);
-
-                        if (led_result == ESP_OK)
-                        {
-                            ESP_LOGI(TAG, "🎨 パレット変更: %s", PALETTE_NAMES[current_value]);
-                        }
-                        else
-                        {
-                            ESP_LOGW(TAG, "LED色変更失敗: %s", esp_err_to_name(led_result));
-                        }
-                    }
-                    else if (g_current_menu == MENU_ITEM_RESOLUTION)
-                    {
-                        // 解像度モード: 解像度を更新
-                        g_current_resolution = (resolution_t)current_value;
-                        ESP_LOGI(TAG, "📐 解像度変更: %s", RESOLUTION_NAMES[current_value]);
-                    }
-
-                    // エンコーダーイベントをキューに送信
-                    if (g_encoder_event_queue != NULL)
-                    {
-                        encoder_event_t event = {
-                            .value = current_value,
-                            .delta = delta,
-                            .timestamp = current_time};
-
-                        if (xQueueSend(g_encoder_event_queue, &event, 0) != pdTRUE)
-                        {
-                            ESP_LOGW(TAG, "エンコーダーイベントキュー満杯");
-                        }
-                    }
-
-                    last_encoder_value = current_value;
-                }
-                else
-                {
-                    // デバウンス時間内の変化は無視（デバッグログ出力）
-                    ESP_LOGD(TAG, "エンコーダー値変化を無視（デバウンス中: %ldms経過）",
-                             time_since_last_change);
-                }
-            }
+            // エンコーダーは現在使用していない（シャッターボタンで設定変更）
+            // 将来的に別の機能に使用する可能性があるため、タスクは残す
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
         }
         else
         {
             vTaskDelay(pdMS_TO_TICKS(500));
         }
 
-        // ポーリング間隔を延長してノイズを低減
-        vTaskDelay(pdMS_TO_TICKS(ENCODER_POLL_INTERVAL_MS));
+        // アプリケーション側のポーリング間隔（ドライバは独自にポーリング）
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
@@ -844,8 +876,8 @@ void camera_preview_task(void *parameter)
 
     while (1)
     {
-        // 撮影中または保存中、またはパレットモード以外はプレビューを停止
-        if (g_system_status != SYSTEM_STATUS_READY || g_current_menu != MENU_ITEM_PALETTE)
+        // 撮影中または保存中、または撮影モード以外はプレビューを停止
+        if (g_system_status != SYSTEM_STATUS_READY || g_current_menu != MENU_ITEM_CAPTURE)
         {
             vTaskDelay(pdMS_TO_TICKS(UPDATE_INTERVAL_MS));
             continue;
@@ -980,8 +1012,8 @@ void histogram_task(void *parameter)
 
     while (1)
     {
-        // 撮影中または保存中、またはパレットモード以外はヒストグラムを停止
-        if (g_system_status != SYSTEM_STATUS_READY || g_current_menu != MENU_ITEM_PALETTE)
+        // 撮影中または保存中、または撮影モード以外はヒストグラムを停止
+        if (g_system_status != SYSTEM_STATUS_READY || g_current_menu != MENU_ITEM_CAPTURE)
         {
             vTaskDelay(pdMS_TO_TICKS(UPDATE_INTERVAL_MS));
             continue;
@@ -1122,58 +1154,119 @@ void menu_display_task(void *parameter)
     menu_terminal.set_auto_wrap(false);
     menu_terminal.set_auto_scroll(false);
 
+    // 撮影モード表示用ターミナル作成
+    Terminal capture_terminal(8, 2);
+    capture_terminal.init();
+    capture_terminal.set_position(64, 0);
+    capture_terminal.set_border(false);
+    capture_terminal.set_auto_wrap(false);
+    capture_terminal.set_auto_scroll(false);
+
     while (1)
     {
+        // 撮影中または保存中はメニュー表示を抑止
+        if (g_system_status == SYSTEM_STATUS_CAPTURING || g_system_status == SYSTEM_STATUS_SAVING)
+        {
+            vTaskDelay(pdMS_TO_TICKS(UPDATE_INTERVAL_MS));
+            continue;
+        }
+
         // 常にメニューを表示（全モードで動作）
         if (g_display_ready && g_display_mutex != NULL &&
             xSemaphoreTake(g_display_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
         {
-            // パレットモード以外の時は画面をクリア
-            if (g_current_menu != MENU_ITEM_PALETTE)
+            if (g_current_menu == MENU_ITEM_CAPTURE)
             {
-                g_display->clear();
-            }
+                // 撮影モード: カメラプレビューを優先し、メニューは表示しない
 
-            // ターミナルをクリア
-            menu_terminal.clear();
-
-            // 各メニュー項目を表示
-            for (int i = 0; i < 5; i++)
-            {
-                // カーソル位置を設定
-                menu_terminal.set_cursor(i, 0);
-
-                // 選択中の項目には先頭に「>」を表示
-                if (i == g_current_menu)
+                // メニュー表示領域（右側）のみをクリア
+                // プレビュー領域(0-63, 0-63)は残し、右側(64-127, 0-63)をクリア
+                for (int y = 0; y < 64; y++)
                 {
-                    // 反転表示用に文字列を作成
-                    g_display->terminal_print(&menu_terminal, ">");
+                    for (int x = 64; x < 128; x++)
+                    {
+                        g_display->set_pixel(x, y, false);
+                    }
+                }
+
+                // 「さつえいモード」とだけ表示
+                g_display->draw_string(64, 0, "さつえい", true);
+                g_display->draw_string(64, 8, "モード", true);
+
+                // 選択中のパレット名を表示
+                g_display->draw_string(80, 40, PALETTE_NAMES[g_current_palette_index], true);
+                // 選択中の解像度名を表示
+                g_display->draw_string(80, 48, RESOLUTION_NAMES[g_current_resolution], true);
+                // SDカードの状態を表示
+                if (g_sd_card_mounted)
+                {
+                    g_display->draw_string(80, 56, "SD: OK", true);
                 }
                 else
                 {
-                    g_display->terminal_print(&menu_terminal, " ");
+                    g_display->draw_string(80, 56, "SD: ERR", true);
                 }
 
-                // メニュー項目名を表示
-                g_display->terminal_print(&menu_terminal, MENU_ITEM_NAMES[i]);
-            }
-
-            // 選択中のパレット名を表示
-            g_display->draw_string(80, 40, PALETTE_NAMES[g_current_palette_index], true);
-            // 選択中の解像度名を表示
-            g_display->draw_string(80, 48, RESOLUTION_NAMES[g_current_resolution], true);
-            // SDカードの状態を表示
-            if (g_sd_card_mounted)
-            {
-                g_display->draw_string(80, 56, "SD: OK", true);
+                // 画面更新
+                g_display->display();
             }
             else
             {
-                g_display->draw_string(80, 56, "SD: ERR", true);
+                // メニューモード: 画面をクリアしてメニューを表示
+                g_display->clear();
+
+                // パレットモードまたは解像度モードの場合、カメラプレビュー領域に説明文を表示
+                if (g_current_menu == MENU_ITEM_PALETTE)
+                {
+                    // パレット説明文を表示（左側領域、0, 0から）
+                    g_display->draw_string(0, 0, PALETTE_DESCRIPTIONS[g_current_palette_index], false);
+                }
+                else if (g_current_menu == MENU_ITEM_RESOLUTION)
+                {
+                    // 解像度説明文を表示（左側領域、0, 0から）
+                    g_display->draw_string(0, 0, RESOLUTION_DESCRIPTIONS[g_current_resolution], false);
+                }
+
+                // ターミナルをクリア
+                menu_terminal.clear();
+
+                // メニュー項目を表示（MENU_ITEM_PALETTE以降、インデックス1から）
+                for (int i = 1; i < 6; i++)  // i=1から開始（MENU_ITEM_PALETTEから）
+                {
+                    // カーソル位置を設定（表示上は0行目から）
+                    menu_terminal.set_cursor(i - 1, 0);
+
+                    // 選択中の項目には先頭に「>」を表示
+                    if (i == g_current_menu)
+                    {
+                        g_display->terminal_print(&menu_terminal, ">");
+                    }
+                    else
+                    {
+                        g_display->terminal_print(&menu_terminal, " ");
+                    }
+
+                    // メニュー項目名を表示（MENU_ITEM_NAMES[i-1]でアクセス）
+                    g_display->terminal_print(&menu_terminal, MENU_ITEM_NAMES[i - 1]);
+                }
+
+                // 選択中のパレット名を表示
+                g_display->draw_string(80, 40, PALETTE_NAMES[g_current_palette_index], true);
+                // 選択中の解像度名を表示
+                g_display->draw_string(80, 48, RESOLUTION_NAMES[g_current_resolution], true);
+                // SDカードの状態を表示
+                if (g_sd_card_mounted)
+                {
+                    g_display->draw_string(80, 56, "SD: OK", true);
+                }
+                else
+                {
+                    g_display->draw_string(80, 56, "SD: ERR", true);
+                }
+                // メニューを描画して画面を更新
+                g_display->draw_terminal(&menu_terminal);
+                g_display->display();
             }
-            // メニューを描画して画面を更新
-            g_display->draw_terminal(&menu_terminal);
-            g_display->display();
 
             xSemaphoreGive(g_display_mutex);
         }
@@ -1239,10 +1332,122 @@ void generate_random_string(char* buf, int len)
     buf[len] = '\0';
 }
 
-// パレット減色アルゴリズム（最近傍色探索）
-void apply_palette_reduction(uint8_t* rgb_data, int width, int height, int palette_idx)
+/**
+ * @brief 画像のリサイズとクロップを行う
+ *
+ * 640x480の画像を目標サイズにリサイズします。
+ * アスペクト比を維持しながら、目標サイズに収まる最大サイズを計算し、
+ * 必要に応じて中央トリミングを行います。
+ *
+ * @param src_rgb888 入力RGB888データ（640x480固定）
+ * @param dst_rgb888 出力RGB888データバッファ（dst_width * dst_height * 3バイト必要）
+ * @param dst_width 目標幅
+ * @param dst_height 目標高さ
+ */
+void resize_and_crop_image(uint8_t* src_rgb888, uint8_t* dst_rgb888, int dst_width, int dst_height)
 {
-    const uint32_t* palette = COLOR_PALETTES[palette_idx];
+    const int src_width = 640;
+    const int src_height = 480;
+
+    // 目標サイズがソースと同じ場合はコピーのみ
+    if (dst_width == src_width && dst_height == src_height)
+    {
+        memcpy(dst_rgb888, src_rgb888, src_width * src_height * 3);
+        return;
+    }
+
+    ESP_LOGI(TAG, "リサイズ開始: %dx%d -> %dx%d", src_width, src_height, dst_width, dst_height);
+
+    // アスペクト比を計算
+    float src_aspect = (float)src_width / (float)src_height;  // 640/480 = 1.333
+    float dst_aspect = (float)dst_width / (float)dst_height;
+
+    // クロップ領域を計算（ソース画像上での座標）
+    int crop_x = 0, crop_y = 0;
+    int crop_width = src_width;
+    int crop_height = src_height;
+
+    if (dst_aspect > src_aspect)
+    {
+        // 目標が横長: 縦をクロップ
+        crop_height = (int)(src_width / dst_aspect);
+        crop_y = (src_height - crop_height) / 2;
+    }
+    else if (dst_aspect < src_aspect)
+    {
+        // 目標が縦長: 横をクロップ
+        crop_width = (int)(src_height * dst_aspect);
+        crop_x = (src_width - crop_width) / 2;
+    }
+
+    ESP_LOGD(TAG, "クロップ領域: x=%d, y=%d, w=%d, h=%d", crop_x, crop_y, crop_width, crop_height);
+
+    // バイリニア補間でリサイズ
+    for (int dst_y = 0; dst_y < dst_height; dst_y++)
+    {
+        for (int dst_x = 0; dst_x < dst_width; dst_x++)
+        {
+            // 目標座標をソース座標にマッピング
+            float src_x_f = crop_x + (dst_x + 0.5f) * crop_width / dst_width - 0.5f;
+            float src_y_f = crop_y + (dst_y + 0.5f) * crop_height / dst_height - 0.5f;
+
+            // 座標をクリップ
+            if (src_x_f < crop_x) src_x_f = crop_x;
+            if (src_y_f < crop_y) src_y_f = crop_y;
+            if (src_x_f > crop_x + crop_width - 1) src_x_f = crop_x + crop_width - 1;
+            if (src_y_f > crop_y + crop_height - 1) src_y_f = crop_y + crop_height - 1;
+
+            int x0 = (int)src_x_f;
+            int y0 = (int)src_y_f;
+            int x1 = (x0 + 1 < src_width) ? (x0 + 1) : x0;
+            int y1 = (y0 + 1 < src_height) ? (y0 + 1) : y0;
+
+            float dx = src_x_f - x0;
+            float dy = src_y_f - y0;
+
+            // 4点の画素を取得
+            int idx00 = (y0 * src_width + x0) * 3;
+            int idx01 = (y0 * src_width + x1) * 3;
+            int idx10 = (y1 * src_width + x0) * 3;
+            int idx11 = (y1 * src_width + x1) * 3;
+
+            // RGB各チャンネルでバイリニア補間
+            int dst_idx = (dst_y * dst_width + dst_x) * 3;
+            for (int c = 0; c < 3; c++)
+            {
+                float val00 = src_rgb888[idx00 + c];
+                float val01 = src_rgb888[idx01 + c];
+                float val10 = src_rgb888[idx10 + c];
+                float val11 = src_rgb888[idx11 + c];
+
+                float val0 = val00 * (1.0f - dx) + val01 * dx;
+                float val1 = val10 * (1.0f - dx) + val11 * dx;
+                float val = val0 * (1.0f - dy) + val1 * dy;
+
+                dst_rgb888[dst_idx + c] = (uint8_t)(val + 0.5f);
+            }
+        }
+    }
+
+    ESP_LOGI(TAG, "リサイズ完了");
+}
+
+// パレット減色アルゴリズム（最近傍色探索）
+// color_count: 8 または 16
+void apply_palette_reduction(uint8_t* rgb_data, int width, int height, int palette_idx, int color_count)
+{
+    const uint32_t* palette;
+
+    // 色数に応じてパレットを選択
+    if (color_count == 16)
+    {
+        palette = COLOR_PALETTES_16[palette_idx];
+    }
+    else
+    {
+        palette = COLOR_PALETTES_8[palette_idx];
+        color_count = 8;  // 念のため8に固定
+    }
 
     for (int i = 0; i < width * height; i++)
     {
@@ -1255,7 +1460,7 @@ void apply_palette_reduction(uint8_t* rgb_data, int width, int height, int palet
         int min_distance = INT32_MAX;
         uint32_t closest_color = palette[0];
 
-        for (int j = 0; j < 8; j++)
+        for (int j = 0; j < color_count; j++)
         {
             uint32_t pal_color = palette[j];
             int pal_r = (pal_color >> 16) & 0xFF;
@@ -1434,16 +1639,17 @@ void capture_task(void *parameter)
     ESP_LOGI(TAG, "   ランダム文字列: %s", random_str);
     ESP_LOGI(TAG, "   ファイルカウンター: %d", g_file_counter);
 
-    int total_steps = all_palettes ? 9 : 2;  // 元画像 + パレット数
+    // 元画像 + パレット数×2（8色と16色）
+    int total_steps = all_palettes ? 17 : 3;  // 全パレット: 1 + 8*2, 単一: 1 + 1*2
     int current_step = 0;
     ESP_LOGI(TAG, "   総ステップ数: %d", total_steps);
 
     // カメラからフレーム取得
+    ESP_LOGI(TAG, "   フレーム取得開始...");
     camera_fb_t *fb = esp_camera_fb_get();
     if (fb == NULL)
     {
         ESP_LOGE(TAG, "❌ カメラフレーム取得失敗");
-        g_system_status = SYSTEM_STATUS_ERROR;
 
         // エラー表示
         if (g_display_ready && g_display_mutex != NULL && xSemaphoreTake(g_display_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
@@ -1459,16 +1665,24 @@ void capture_task(void *parameter)
             xSemaphoreGive(g_display_mutex);
         }
 
-        // 無限ループ
-        while (1)
-        {
-            vTaskDelay(pdMS_TO_TICKS(1000));
-        }
+        // エラー表示後、待機してシステム状態を戻す
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        g_system_status = SYSTEM_STATUS_READY;
+        ESP_LOGI(TAG, "システム状態をREADYに戻しました");
+        vTaskDelete(NULL);
+        return;
     }
 
     int src_width = fb->width;
     int src_height = fb->height;
     size_t rgb_buffer_size = src_width * src_height * 3;
+
+    // フレームバッファ情報をログ出力
+    ESP_LOGI(TAG, "   フレームバッファ情報:");
+    ESP_LOGI(TAG, "     - サイズ: %dx%d", src_width, src_height);
+    ESP_LOGI(TAG, "     - フォーマット: %d (0=JPEG, 2=RGB565, 4=GRAYSCALE)", fb->format);
+    ESP_LOGI(TAG, "     - バッファサイズ: %zu bytes", fb->len);
+    ESP_LOGI(TAG, "     - 期待サイズ: %zu bytes (RGB565)", (size_t)(src_width * src_height * 2));
 
     // RGB888バッファ確保
     uint8_t *rgb_buffer = (uint8_t *)heap_caps_malloc(rgb_buffer_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -1476,34 +1690,84 @@ void capture_task(void *parameter)
     {
         ESP_LOGE(TAG, "❌ RGBバッファ確保失敗");
         esp_camera_fb_return(fb);
-        g_system_status = SYSTEM_STATUS_ERROR;
-        while (1)
-        {
-            vTaskDelay(pdMS_TO_TICKS(1000));
-        }
+        g_system_status = SYSTEM_STATUS_READY;
+        vTaskDelete(NULL);
+        return;
     }
 
-    // RGB565 → RGB888変換（ビッグエンディアン）
-    uint8_t* fb_data = fb->buf;
-    for (int i = 0; i < src_width * src_height; i++)
+    // フォーマットに応じた変換処理
+    if (fb->format == PIXFORMAT_RGB565)
     {
-        // RGB565をビッグエンディアンで読み取り
-        uint16_t rgb565Color = (fb_data[i * 2] << 8) | fb_data[i * 2 + 1];
+        ESP_LOGI(TAG, "   RGB565 → RGB888変換開始");
+        uint8_t* fb_data = fb->buf;
 
-        // RGB565からRGB888へ変換
-        uint8_t r = ((rgb565Color >> 11) & 0x1F) * 255 / 31;
-        uint8_t g = ((rgb565Color >> 5) & 0x3F) * 255 / 63;
-        uint8_t b = (rgb565Color & 0x1F) * 255 / 31;
+        for (int i = 0; i < src_width * src_height; i++)
+        {
+            // RGB565をビッグエンディアンで読み取り（GC0308カメラの出力形式）
+            uint16_t rgb565Color = (fb_data[i * 2] << 8) | fb_data[i * 2 + 1];
 
-        rgb_buffer[i * 3] = r;
-        rgb_buffer[i * 3 + 1] = g;
-        rgb_buffer[i * 3 + 2] = b;
+            // RGB565からRGB888へ変換
+            uint8_t r = ((rgb565Color >> 11) & 0x1F) * 255 / 31;
+            uint8_t g = ((rgb565Color >> 5) & 0x3F) * 255 / 63;
+            uint8_t b = (rgb565Color & 0x1F) * 255 / 31;
+
+            rgb_buffer[i * 3] = r;
+            rgb_buffer[i * 3 + 1] = g;
+            rgb_buffer[i * 3 + 2] = b;
+        }
+        ESP_LOGI(TAG, "   RGB565→RGB888変換完了");
     }
-
-    ESP_LOGI(TAG, "   RGB565→RGB888変換完了");
+    else
+    {
+        ESP_LOGE(TAG, "❌ 未対応のピクセルフォーマット: %d", fb->format);
+        heap_caps_free(rgb_buffer);
+        esp_camera_fb_return(fb);
+        g_system_status = SYSTEM_STATUS_READY;
+        vTaskDelete(NULL);
+        return;
+    }
 
     // フレームバッファ解放
     esp_camera_fb_return(fb);
+
+    // 選択された解像度を取得
+    int target_width = RESOLUTION_DIMENSIONS[g_current_resolution][0];
+    int target_height = RESOLUTION_DIMENSIONS[g_current_resolution][1];
+    ESP_LOGI(TAG, "   目標解像度: %dx%d (%s)", target_width, target_height, RESOLUTION_NAMES[g_current_resolution]);
+
+    // リサイズが必要かチェック（640x480以外の場合）
+    uint8_t *final_buffer = rgb_buffer;
+    size_t final_buffer_size = rgb_buffer_size;
+    int final_width = src_width;
+    int final_height = src_height;
+
+    if (target_width != 640 || target_height != 480)
+    {
+        // リサイズ用バッファ確保
+        final_buffer_size = target_width * target_height * 3;
+        final_buffer = (uint8_t *)heap_caps_malloc(final_buffer_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (final_buffer == NULL)
+        {
+            ESP_LOGE(TAG, "❌ リサイズバッファ確保失敗");
+            heap_caps_free(rgb_buffer);
+            g_system_status = SYSTEM_STATUS_READY;
+            vTaskDelete(NULL);
+            return;
+        }
+
+        // リサイズ実行
+        resize_and_crop_image(rgb_buffer, final_buffer, target_width, target_height);
+
+        final_width = target_width;
+        final_height = target_height;
+
+        // 元のバッファは不要になったので解放
+        heap_caps_free(rgb_buffer);
+    }
+    else
+    {
+        ESP_LOGI(TAG, "   リサイズ不要（640x480のまま）");
+    }
 
     // 保存状態に変更
     g_system_status = SYSTEM_STATUS_SAVING;
@@ -1518,22 +1782,20 @@ void capture_task(void *parameter)
         xSemaphoreGive(g_display_mutex);
     }
 
-    esp_err_t result = save_rgb_as_bmp(rgb_buffer, src_width, src_height, filepath);
+    esp_err_t result = save_rgb_as_bmp(final_buffer, final_width, final_height, filepath);
     if (result != ESP_OK)
     {
         ESP_LOGE(TAG, "❌ 元画像保存失敗");
-        heap_caps_free(rgb_buffer);
-        g_system_status = SYSTEM_STATUS_ERROR;
-        while (1)
-        {
-            vTaskDelay(pdMS_TO_TICKS(1000));
-        }
+        heap_caps_free(final_buffer);
+        g_system_status = SYSTEM_STATUS_READY;
+        vTaskDelete(NULL);
+        return;
     }
 
     current_step++;
     ESP_LOGI(TAG, "✅ 元画像保存完了 (%d/%d)", current_step, total_steps);
 
-    // パレット減色画像保存
+    // パレット減色画像保存（8色版と16色版の両方）
     int palette_count = all_palettes ? 8 : 1;
     int start_palette = all_palettes ? 0 : g_current_palette_index;
 
@@ -1541,56 +1803,101 @@ void capture_task(void *parameter)
     {
         int palette_idx = all_palettes ? i : start_palette;
 
-        // RGB888バッファをコピー（減色処理は破壊的なため）
-        uint8_t *temp_buffer = (uint8_t *)heap_caps_malloc(rgb_buffer_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (temp_buffer == NULL)
+        // 8色版の保存
         {
-            ESP_LOGE(TAG, "❌ 一時バッファ確保失敗");
-            heap_caps_free(rgb_buffer);
-            g_system_status = SYSTEM_STATUS_ERROR;
-            while (1)
+            // RGB888バッファをコピー（減色処理は破壊的なため）
+            uint8_t *temp_buffer = (uint8_t *)heap_caps_malloc(final_buffer_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (temp_buffer == NULL)
             {
-                vTaskDelay(pdMS_TO_TICKS(1000));
+                ESP_LOGE(TAG, "❌ 一時バッファ確保失敗");
+                heap_caps_free(final_buffer);
+                g_system_status = SYSTEM_STATUS_READY;
+                vTaskDelete(NULL);
+                return;
             }
-        }
 
-        memcpy(temp_buffer, rgb_buffer, rgb_buffer_size);
+            memcpy(temp_buffer, final_buffer, final_buffer_size);
 
-        // プログレスバー更新
-        if (g_display_mutex != NULL && xSemaphoreTake(g_display_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
-        {
-            draw_progress_bar((float)current_step / total_steps, "ほぞんちゅう palette");
-            xSemaphoreGive(g_display_mutex);
-        }
-
-        // パレット減色
-        apply_palette_reduction(temp_buffer, src_width, src_height, palette_idx);
-
-        // ファイル名生成
-        snprintf(filepath, sizeof(filepath), "%s/%04d_%s_%s.bmp",
-                 g_mount_point, g_file_counter, random_str, PALETTE_NAMES[palette_idx]);
-
-        // BMP保存
-        result = save_rgb_as_bmp(temp_buffer, src_width, src_height, filepath);
-        heap_caps_free(temp_buffer);
-
-        if (result != ESP_OK)
-        {
-            ESP_LOGE(TAG, "❌ パレット画像保存失敗: %s", PALETTE_NAMES[palette_idx]);
-            heap_caps_free(rgb_buffer);
-            g_system_status = SYSTEM_STATUS_ERROR;
-            while (1)
+            // プログレスバー更新
+            if (g_display_mutex != NULL && xSemaphoreTake(g_display_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
             {
-                vTaskDelay(pdMS_TO_TICKS(1000));
+                draw_progress_bar((float)current_step / total_steps, "ほぞんちゅう 8col");
+                xSemaphoreGive(g_display_mutex);
             }
+
+            // 8色パレット減色
+            apply_palette_reduction(temp_buffer, final_width, final_height, palette_idx, 8);
+
+            // ファイル名生成（8色版）
+            snprintf(filepath, sizeof(filepath), "%s/%04d_%s_%s_8c.bmp",
+                     g_mount_point, g_file_counter, random_str, PALETTE_NAMES[palette_idx]);
+
+            // BMP保存
+            result = save_rgb_as_bmp(temp_buffer, final_width, final_height, filepath);
+            heap_caps_free(temp_buffer);
+
+            if (result != ESP_OK)
+            {
+                ESP_LOGE(TAG, "❌ 8色パレット画像保存失敗: %s", PALETTE_NAMES[palette_idx]);
+                heap_caps_free(final_buffer);
+                g_system_status = SYSTEM_STATUS_READY;
+                vTaskDelete(NULL);
+                return;
+            }
+
+            current_step++;
+            ESP_LOGI(TAG, "✅ 8色パレット画像保存完了: %s (%d/%d)", PALETTE_NAMES[palette_idx], current_step, total_steps);
         }
 
-        current_step++;
-        ESP_LOGI(TAG, "✅ パレット画像保存完了: %s (%d/%d)", PALETTE_NAMES[palette_idx], current_step, total_steps);
+        // 16色版の保存
+        {
+            // RGB888バッファをコピー
+            uint8_t *temp_buffer = (uint8_t *)heap_caps_malloc(final_buffer_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (temp_buffer == NULL)
+            {
+                ESP_LOGE(TAG, "❌ 一時バッファ確保失敗");
+                heap_caps_free(final_buffer);
+                g_system_status = SYSTEM_STATUS_READY;
+                vTaskDelete(NULL);
+                return;
+            }
+
+            memcpy(temp_buffer, final_buffer, final_buffer_size);
+
+            // プログレスバー更新
+            if (g_display_mutex != NULL && xSemaphoreTake(g_display_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+            {
+                draw_progress_bar((float)current_step / total_steps, "ほぞんちゅう 16col");
+                xSemaphoreGive(g_display_mutex);
+            }
+
+            // 16色パレット減色
+            apply_palette_reduction(temp_buffer, final_width, final_height, palette_idx, 16);
+
+            // ファイル名生成（16色版）
+            snprintf(filepath, sizeof(filepath), "%s/%04d_%s_%s_16c.bmp",
+                     g_mount_point, g_file_counter, random_str, PALETTE_NAMES[palette_idx]);
+
+            // BMP保存
+            result = save_rgb_as_bmp(temp_buffer, final_width, final_height, filepath);
+            heap_caps_free(temp_buffer);
+
+            if (result != ESP_OK)
+            {
+                ESP_LOGE(TAG, "❌ 16色パレット画像保存失敗: %s", PALETTE_NAMES[palette_idx]);
+                heap_caps_free(final_buffer);
+                g_system_status = SYSTEM_STATUS_READY;
+                vTaskDelete(NULL);
+                return;
+            }
+
+            current_step++;
+            ESP_LOGI(TAG, "✅ 16色パレット画像保存完了: %s (%d/%d)", PALETTE_NAMES[palette_idx], current_step, total_steps);
+        }
     }
 
     // メモリ解放
-    heap_caps_free(rgb_buffer);
+    heap_caps_free(final_buffer);
 
     // ファイルカウンター更新
     g_file_counter++;
@@ -1619,6 +1926,8 @@ void capture_task(void *parameter)
 // 撮影開始（タスク生成）
 void start_capture(bool all_palettes)
 {
+    g_system_status = SYSTEM_STATUS_CAPTURING;
+
     ESP_LOGI(TAG, "🚀 start_capture() 呼び出し (all_palettes: %s)", all_palettes ? "Yes" : "No");
     ESP_LOGI(TAG, "   現在の状態: %d", g_system_status);
 
@@ -1653,6 +1962,127 @@ void start_capture(bool all_palettes)
 }
 
 
+/**
+ * @brief NVSから設定を読み込む
+ *
+ * パレット番号と解像度設定をNVSから読み込み、グローバル変数に反映します。
+ * エラー時はデフォルト値を維持します。
+ */
+static void load_settings_from_nvs(void)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs_handle);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "⚠️ NVS名前空間オープン失敗: %s - デフォルト設定を使用", esp_err_to_name(err));
+        return;
+    }
+
+    // パレット番号の読み込み
+    uint8_t palette_idx;
+    err = nvs_get_u8(nvs_handle, NVS_KEY_PALETTE, &palette_idx);
+    if (err == ESP_OK)
+    {
+        if (palette_idx < MAX_PALETTE_INDEX)
+        {
+            g_current_palette_index = palette_idx;
+            ESP_LOGI(TAG, "📥 パレット読み込み: %d (%s)", palette_idx, PALETTE_NAMES[palette_idx]);
+        }
+        else
+        {
+            ESP_LOGW(TAG, "⚠️ 無効なパレット番号: %d - デフォルト値を使用", palette_idx);
+        }
+    }
+    else if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        ESP_LOGI(TAG, "📥 パレット設定が見つかりません - デフォルト値を使用");
+    }
+    else
+    {
+        ESP_LOGE(TAG, "❌ パレット読み込みエラー: %s", esp_err_to_name(err));
+    }
+
+    // 解像度の読み込み
+    uint8_t resolution;
+    err = nvs_get_u8(nvs_handle, NVS_KEY_RESOLUTION, &resolution);
+    if (err == ESP_OK)
+    {
+        if (resolution < MAX_RESOLUTION_INDEX)
+        {
+            g_current_resolution = (resolution_t)resolution;
+            ESP_LOGI(TAG, "📥 解像度読み込み: %d (%s)", resolution, RESOLUTION_NAMES[resolution]);
+        }
+        else
+        {
+            ESP_LOGW(TAG, "⚠️ 無効な解像度: %d - デフォルト値を使用", resolution);
+        }
+    }
+    else if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        ESP_LOGI(TAG, "📥 解像度設定が見つかりません - デフォルト値を使用");
+    }
+    else
+    {
+        ESP_LOGE(TAG, "❌ 解像度読み込みエラー: %s", esp_err_to_name(err));
+    }
+
+    nvs_close(nvs_handle);
+    ESP_LOGI(TAG, "✅ 設定読み込み完了: パレット=%d, 解像度=%d",
+             g_current_palette_index, g_current_resolution);
+}
+
+/**
+ * @brief NVSに設定を保存する
+ *
+ * 現在のパレット番号と解像度設定をNVSに保存します。
+ * エラー時はログ出力のみで、カメラ動作は継続します。
+ */
+static void save_settings_to_nvs(void)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "❌ NVS名前空間オープン失敗: %s", esp_err_to_name(err));
+        return;
+    }
+
+    bool save_failed = false;
+
+    // パレット番号の保存
+    err = nvs_set_u8(nvs_handle, NVS_KEY_PALETTE, g_current_palette_index);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "❌ パレット保存失敗: %s", esp_err_to_name(err));
+        save_failed = true;
+    }
+
+    // 解像度の保存
+    err = nvs_set_u8(nvs_handle, NVS_KEY_RESOLUTION, (uint8_t)g_current_resolution);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "❌ 解像度保存失敗: %s", esp_err_to_name(err));
+        save_failed = true;
+    }
+
+    // 変更をコミット
+    err = nvs_commit(nvs_handle);
+    if (err == ESP_OK && !save_failed)
+    {
+        ESP_LOGI(TAG, "💾 設定保存完了: パレット=%d (%s), 解像度=%d (%s)",
+                 g_current_palette_index, PALETTE_NAMES[g_current_palette_index],
+                 g_current_resolution, RESOLUTION_NAMES[g_current_resolution]);
+    }
+    else
+    {
+        ESP_LOGE(TAG, "❌ NVSコミット失敗: %s", esp_err_to_name(err));
+    }
+
+    nvs_close(nvs_handle);
+}
+
 extern "C" void app_main(void)
 {
     ESP_LOGI(TAG, "\n🎮 ===== AtomS3R ピクセルアートカメラ起動 =====");
@@ -1669,6 +2099,9 @@ extern "C" void app_main(void)
     }
     ESP_ERROR_CHECK(nvs_result);
     ESP_LOGI(TAG, "✅ NVS初期化成功");
+
+    // NVSから設定を読み込み
+    load_settings_from_nvs();
 
     // I2C初期化（最優先）
     esp_err_t i2c_result = init_external_i2c();
@@ -1756,7 +2189,7 @@ extern "C" void app_main(void)
     display_init_step(&terminal, " Encoder init");
     pimoroni_encoder_config_t encoder_config = pimoroni_encoder_get_default_config(EXTERNAL_I2C_NUM);
     encoder_config.i2c_address = PIMORONI_ENCODER_I2C_ADDR;
-    encoder_config.direction = PIMORONI_ENCODER_CCW; // 修正: ハードウェアの実際の回転方向に合わせて反転
+    encoder_config.direction = PIMORONI_ENCODER_CW; // 時計回り（正の方向）
     encoder_config.brightness = 1.0f;
     encoder_config.interrupt_pin = GPIO_NUM_NC;
     encoder_config.skip_chip_id_check = false;
@@ -1788,7 +2221,7 @@ extern "C" void app_main(void)
     {
         task_result = xTaskCreate(encoder_task, "encoder_task",
                                   ENCODER_TASK_STACK, NULL,
-                                  tskIDLE_PRIORITY + 2, NULL);
+                                  tskIDLE_PRIORITY + 4, NULL); // 優先度向上: 取りこぼし防止
     }
     display_init_step(&terminal, task_result == pdPASS);
 

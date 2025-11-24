@@ -109,15 +109,27 @@ extern "C"
      */
     typedef struct
     {
+        // ハードウェア設定
         i2c_port_t i2c_port;                    // I2Cポート番号
         uint8_t i2c_address;                    // I2Cアドレス
         gpio_num_t interrupt_pin;               // 割り込みピン（オプション）
         pimoroni_encoder_direction_t direction; // エンコーダー回転方向
         float brightness;                       // LED明度（0.01-1.0）
+
+        // 内部状態（ポーリングタスクで使用）
         int16_t encoder_offset;                 // エンコーダーオフセット値
         int16_t encoder_last;                   // 前回のエンコーダー値
         uint8_t encoder_raw_last;               // 前回の生の値（デバウンス用）
-        int8_t encoder_accumulator;             // 累積カウンタ（±1の変化を蓄積）
+        float encoder_accumulator;              // 累積カウンタ（±1の変化を蓄積）
+        uint32_t encoder_accumulator_time;      // 累積開始時刻（タイムアウト判定用）
+
+        // ドライバ内部タスク用
+        TaskHandle_t poll_task_handle;          // ポーリングタスクハンドル
+        int16_t current_value;                  // 現在の安定した値（アプリに公開）
+        int8_t last_direction;                  // 最後の方向（-1, 0, +1）
+        int8_t last_raw_diff;                   // 最後の生のdiff値（チャタリング検出用）
+        uint32_t last_change_time;              // 最後に値が変化した時刻
+        bool initialized;                       // 初期化完了フラグ
     } pimoroni_encoder_t;
 
     /**
@@ -153,12 +165,23 @@ extern "C"
     esp_err_t pimoroni_encoder_deinit(pimoroni_encoder_t *encoder);
 
     /**
-     * @brief エンコーダーの回転値を読み取り
+     * @brief エンコーダーの回転値を読み取り（低レベルAPI）
      *
      * @param encoder エンコーダーデバイス構造体
      * @return エンコーダーの累積回転値（正: 時計回り, 負: 反時計回り）
+     * @note この関数は内部使用向けです。アプリケーションは pimoroni_encoder_get_value() を使用してください。
      */
     int16_t pimoroni_encoder_read(pimoroni_encoder_t *encoder);
+
+    /**
+     * @brief 安定したエンコーダー値を取得（推奨API）
+     *
+     * @param encoder エンコーダーデバイス構造体
+     * @return フィルタリング・デバウンス処理済みの安定した値
+     * @note この関数はドライバ内部のポーリングタスクで処理された安定した値を返します。
+     *       チャタリング除去、方向ベースのデバウンス、±1振動抑制が適用されています。
+     */
+    int16_t pimoroni_encoder_get_value(pimoroni_encoder_t *encoder);
 
     /**
      * @brief エンコーダーの回転値をクリア（ゼロリセット）
