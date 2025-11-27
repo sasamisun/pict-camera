@@ -8,7 +8,7 @@ idf_component_register(
         "terminal.cpp"
     INCLUDE_DIRS
         "."
-    REQUIRES 
+    REQUIRES
         "esp32-camera"
         "driver"
         "fatfs"
@@ -19,6 +19,7 @@ idf_component_register(
         "esp_common"
         "heap"
         "log"
+        "esp_tinyusb"
     PRIV_REQUIRES
         "M5GFX"                       # M5Stack用グラフィックライブラリ
         

@@ -19,6 +19,7 @@
 #include "esp_system.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_task_wdt.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_heap_caps.h"
@@ -38,6 +39,10 @@
 // ファイルシステム
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
+
+// USB MSC
+#include "tinyusb.h"
+#include "tusb_msc_storage.h"
 
 // M5GFX (ディスプレイ用、オプション)
 #ifdef CONFIG_ENABLE_M5GFX
@@ -147,6 +152,7 @@ typedef enum
     SYSTEM_STATUS_READY,
     SYSTEM_STATUS_CAPTURING,
     SYSTEM_STATUS_SAVING,
+    SYSTEM_STATUS_USB_MSC,
     SYSTEM_STATUS_ERROR,
 } system_status_t;
 
@@ -241,6 +247,9 @@ static volatile system_status_t g_system_status = SYSTEM_STATUS_INITIALIZING;
 static sdmmc_card_t *g_sd_card = NULL;
 static const char *g_mount_point = "/sdcard";
 static bool g_sd_card_mounted = false;
+
+// USB MSC状態管理
+static bool g_usb_msc_active = false;
 
 // ========================================
 // カラーパレット定義（8種類×8色）
@@ -614,6 +623,199 @@ esp_err_t init_sd_card(void)
     return ESP_OK;
 }
 
+esp_err_t deinit_sd_card(void)
+{
+    ESP_LOGI(TAG, "SDカードアンマウント開始");
+
+    if (!g_sd_card_mounted) {
+        ESP_LOGW(TAG, "SDカードは既にアンマウント済み");
+        return ESP_OK;
+    }
+
+    // SDカードをアンマウント
+    esp_err_t ret = esp_vfs_fat_sdcard_unmount(g_mount_point, g_sd_card);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SDカードアンマウント失敗: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    // SPIバスを解放
+    ret = spi_bus_free(SPI2_HOST);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SPIバス解放失敗: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    g_sd_card_mounted = false;
+    g_sd_card = NULL;
+    ESP_LOGI(TAG, "✅ SDカードアンマウント完了");
+    return ESP_OK;
+}
+
+// ========================================
+// USB MSC関連関数
+// ========================================
+
+// TinyUSBドライバインストール済みフラグ
+static bool g_tinyusb_driver_installed = false;
+// USB MSCストレージ初期化済みフラグ
+static bool g_usb_msc_initialized = false;
+
+esp_err_t init_tinyusb_driver(void)
+{
+    ESP_LOGI(TAG, "📦 TinyUSBドライバ初期化開始");
+    ESP_LOGI(TAG, "💾 空きヒープ（開始時）: %u bytes", (unsigned int)esp_get_free_heap_size());
+    ESP_LOGI(TAG, "💾 空き内部RAM: %u bytes", (unsigned int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    ESP_LOGI(TAG, "💾 空きDMA RAM: %u bytes", (unsigned int)heap_caps_get_free_size(MALLOC_CAP_DMA));
+
+    if (g_tinyusb_driver_installed) {
+        ESP_LOGW(TAG, "⚠️ TinyUSBドライバは既にインストール済みです");
+        return ESP_OK;
+    }
+
+    // ウォッチドッグをリセット（長時間処理のため）
+    ESP_LOGI(TAG, "🐕 ウォッチドッグリセット");
+    esp_task_wdt_reset();
+
+    ESP_LOGI(TAG, "🔧 TinyUSB設定準備中...");
+    // TinyUSBドライバをインストール（MSC専用デバイス）
+    const tinyusb_config_t tusb_cfg = {
+        .device_descriptor = NULL,          // デフォルト記述子を使用
+        .string_descriptor = NULL,          // デフォルト文字列を使用
+        .string_descriptor_count = 0,       // デフォルト文字列数
+        .external_phy = false,              // 内蔵PHYを使用
+        .configuration_descriptor = NULL,   // デフォルト設定を使用（MSC専用）
+        .self_powered = false,              // バスパワーデバイス
+        .vbus_monitor_io = -1               // VBUS検出GPIO無効化（重要: USB接続時のクラッシュ回避）
+    };
+
+    ESP_LOGI(TAG, "📞 tinyusb_driver_install()呼び出し直前...");
+    ESP_LOGI(TAG, "⏱️  タスク優先度: %d", uxTaskPriorityGet(NULL));
+
+    esp_err_t ret = tinyusb_driver_install(&tusb_cfg);
+
+    ESP_LOGI(TAG, "📞 tinyusb_driver_install()完了: %s", esp_err_to_name(ret));
+
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "❌ TinyUSBドライバインストール失敗: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "💾 空きヒープ（失敗時）: %u bytes", (unsigned int)esp_get_free_heap_size());
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "💾 空きヒープ（インストール後）: %u bytes", (unsigned int)esp_get_free_heap_size());
+    ESP_LOGI(TAG, "💾 空き内部RAM（インストール後）: %u bytes", (unsigned int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+
+    g_tinyusb_driver_installed = true;
+
+    // ウォッチドッグをリセット（USBバス安定化待機前）
+    esp_task_wdt_reset();
+
+    ESP_LOGI(TAG, "⏳ USBバス安定化待機中（500ms）...");
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    ESP_LOGI(TAG, "✅ TinyUSBドライバ初期化完了（MSC専用デバイス）");
+    return ESP_OK;
+}
+
+esp_err_t start_usb_msc(void)
+{
+    ESP_LOGI(TAG, "🔌 USB MSCモード開始");
+
+    if (g_usb_msc_active) {
+        ESP_LOGW(TAG, "⚠️ USB MSCモードは既に有効です");
+        return ESP_OK;
+    }
+
+    if (!g_tinyusb_driver_installed) {
+        ESP_LOGE(TAG, "❌ TinyUSBドライバが初期化されていません");
+        ESP_LOGE(TAG, "   起動時の初期化に失敗した可能性があります");
+        return ESP_FAIL;
+    }
+
+    if (!g_sd_card || !g_sd_card_mounted) {
+        ESP_LOGE(TAG, "❌ SDカードがマウントされていません");
+        return ESP_FAIL;
+    }
+
+    // 通常のSDカードをアンマウント
+    ESP_LOGI(TAG, "📂 SDカードをアンマウント中...");
+    esp_err_t ret = deinit_sd_card();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "❌ SDカードアンマウント失敗: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    ESP_LOGI(TAG, "✅ SDカードアンマウント完了");
+
+    // TinyUSB MSCストレージとしてSDカードを初期化
+    ESP_LOGI(TAG, "💾 USB MSCストレージ初期化中...");
+    const tinyusb_msc_sdmmc_config_t msc_cfg = {
+        .card = g_sd_card,
+        .callback_mount_changed = NULL,
+        .callback_premount_changed = NULL,
+        .mount_config = {
+            .format_if_mount_failed = false,
+            .max_files = 5,
+            .allocation_unit_size = 16 * 1024
+        }
+    };
+
+    ret = tinyusb_msc_storage_init_sdmmc(&msc_cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "❌ USB MSCストレージ初期化失敗: %s", esp_err_to_name(ret));
+        // エラー時は通常のSDカードを再マウント
+        ESP_LOGW(TAG, "🔄 SDカードを再マウント中...");
+        init_sd_card();
+        return ret;
+    }
+
+    g_usb_msc_initialized = true;
+    g_usb_msc_active = true;
+    g_sd_card_mounted = false;
+
+    ESP_LOGI(TAG, "✅ USB MSCモード開始完了");
+    ESP_LOGI(TAG, "🖥️  PCからマスストレージデバイスとして見えます");
+    return ESP_OK;
+}
+
+esp_err_t stop_usb_msc(void)
+{
+    ESP_LOGI(TAG, "🔌 USB MSCモード停止");
+
+    if (!g_usb_msc_active) {
+        ESP_LOGW(TAG, "⚠️ USB MSCモードは既に停止しています");
+        return ESP_OK;
+    }
+
+    if (!g_usb_msc_initialized) {
+        ESP_LOGE(TAG, "❌ USB MSCストレージが初期化されていません");
+        g_usb_msc_active = false;
+        return ESP_FAIL;
+    }
+
+    // TinyUSB MSCストレージを解放
+    ESP_LOGI(TAG, "🗑️  USB MSCストレージ解放中...");
+    tinyusb_msc_storage_deinit();
+    g_usb_msc_initialized = false;
+    ESP_LOGI(TAG, "✅ USB MSCストレージ解放完了");
+
+    // 少し待機してから再マウント
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    // 通常のSDカードを再マウント
+    ESP_LOGI(TAG, "📂 SDカード再マウント中...");
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "❌ SDカード再マウント失敗: %s", esp_err_to_name(ret));
+        g_usb_msc_active = false;
+        return ret;
+    }
+
+    g_usb_msc_active = false;
+    ESP_LOGI(TAG, "✅ USB MSCモード停止完了");
+    ESP_LOGI(TAG, "📷 通常の撮影モードに戻りました");
+    return ESP_OK;
+}
+
 void print_sd_card_info(void)
 {
     if (!g_sd_card_mounted || g_sd_card == NULL)
@@ -698,8 +900,14 @@ button_event_t get_button_event(button_state_t *button)
 
 void process_button_events(void)
 {
-    // 撮影中または保存中は入力を無視
+    // 撮影中、保存中、またはUSB MSCモード中は入力を無視（USB MSCモードを除く）
     if (g_system_status == SYSTEM_STATUS_CAPTURING || g_system_status == SYSTEM_STATUS_SAVING)
+    {
+        return;
+    }
+
+    // USB MSCモード中はメニューボタン以外の操作を制限
+    if (g_system_status == SYSTEM_STATUS_USB_MSC && g_current_menu != MENU_ITEM_USB)
     {
         return;
     }
@@ -743,6 +951,26 @@ void process_button_events(void)
             g_current_resolution = (resolution_t)((g_current_resolution + 1) % MAX_RESOLUTION_INDEX);
             ESP_LOGI(TAG, "📐 解像度変更: %s (index: %d)",
                      RESOLUTION_NAMES[g_current_resolution], g_current_resolution);
+        }
+        else if (g_current_menu == MENU_ITEM_USB)
+        {
+            // USB MSCモード: オン/オフ切り替え
+            if (g_usb_msc_active)
+            {
+                // USB MSCモードを停止して通常モードに戻る
+                if (stop_usb_msc() == ESP_OK)
+                {
+                    g_system_status = SYSTEM_STATUS_READY;
+                }
+            }
+            else
+            {
+                // USB MSCモードを開始
+                if (start_usb_msc() == ESP_OK)
+                {
+                    g_system_status = SYSTEM_STATUS_USB_MSC;
+                }
+            }
         }
         else
         {
@@ -1215,7 +1443,7 @@ void menu_display_task(void *parameter)
                 // メニューモード: 画面をクリアしてメニューを表示
                 g_display->clear();
 
-                // パレットモードまたは解像度モードの場合、カメラプレビュー領域に説明文を表示
+                // パレットモード、解像度モード、USBモードの場合、カメラプレビュー領域に説明文を表示
                 if (g_current_menu == MENU_ITEM_PALETTE)
                 {
                     // パレット説明文を表示（左側領域、0, 0から）
@@ -1225,6 +1453,24 @@ void menu_display_task(void *parameter)
                 {
                     // 解像度説明文を表示（左側領域、0, 0から）
                     g_display->draw_string(0, 0, RESOLUTION_DESCRIPTIONS[g_current_resolution], false);
+                }
+                else if (g_current_menu == MENU_ITEM_USB)
+                {
+                    // USBモード説明文を表示
+                    if (g_usb_msc_active)
+                    {
+                        g_display->draw_string(0, 0, "USB MSC", false);
+                        g_display->draw_string(0, 8, "MODE: ON", false);
+                        g_display->draw_string(0, 16, "Connected", false);
+                        g_display->draw_string(0, 24, "to PC", false);
+                    }
+                    else
+                    {
+                        g_display->draw_string(0, 0, "USB MSC", false);
+                        g_display->draw_string(0, 8, "MODE: OFF", false);
+                        g_display->draw_string(0, 16, "Press", false);
+                        g_display->draw_string(0, 24, "Shutter", false);
+                    }
                 }
 
                 // ターミナルをクリア
@@ -1926,6 +2172,13 @@ void capture_task(void *parameter)
 // 撮影開始（タスク生成）
 void start_capture(bool all_palettes)
 {
+    // USB MSCモード中は撮影を防止
+    if (g_system_status == SYSTEM_STATUS_USB_MSC)
+    {
+        ESP_LOGW(TAG, "⚠️ USB MSCモード中のため撮影できません");
+        return;
+    }
+
     g_system_status = SYSTEM_STATUS_CAPTURING;
 
     ESP_LOGI(TAG, "🚀 start_capture() 呼び出し (all_palettes: %s)", all_palettes ? "Yes" : "No");
@@ -2154,11 +2407,20 @@ extern "C" void app_main(void)
 
     // ===== 初期化シーケンス開始 =====
 
-    // GPIO初期化
-
+    // GPIO初期化（最初に実行）
     display_init_step(&terminal, " GPIO init");
     esp_err_t gpio_result = init_gpio();
     display_init_step(&terminal, gpio_result == ESP_OK);
+
+    // TinyUSBドライバ初期化（カメラより前に実行し、リソース競合を回避）
+    display_init_step(&terminal, " TinyUSB init");
+    esp_err_t usb_result = init_tinyusb_driver();
+    bool usb_ok = (usb_result == ESP_OK);
+    display_init_step(&terminal, usb_ok);
+
+    if (!usb_ok) {
+        ESP_LOGW(TAG, "⚠️ TinyUSB初期化失敗 - USB MSC機能は使用できません");
+    }
 
     // カメラ初期化
     display_init_step(&terminal, " Camera init");
